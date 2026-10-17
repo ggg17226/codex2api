@@ -171,6 +171,17 @@ func geminiCountTokensInboundEndpoint() string {
 	return "/v1beta/models:countTokens"
 }
 
+// geminiNativeSelectionOptions 组装 native Gemini 入口（generateContent /
+// streamGenerateContent / countTokens）的选号上下文。
+//
+// 这两个入口的候选池被 antigravityOAuthChannelAccountFilter 硬限定为 Antigravity OAuth，
+// 因此渠道必须按候选池的真实归属取 antigravity：auto 渠道 Key（requestUpstreamChannel 为
+// 空）走这里时，若沿用请求渠道，auth 侧 isAntigravityProvider("") 为 false，首绑 / Fresh
+// 加权避险会整体失效。
+func geminiNativeSelectionOptions(c *gin.Context, model string, policy auth.DispatchPolicy) auth.SelectionOptions {
+	return selectionOptionsForRequestWithProvider(c, model, policy, database.UpstreamChannelAntigravity)
+}
+
 func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody []byte) {
 	if h.enforceAPIKeyLimitsAndReply(c, model) {
 		return
@@ -184,7 +195,7 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 	}
 
 	accountFilter := antigravityOAuthChannelAccountFilter(model)
-	accountFilter = h.withModelCooldownFilter(c.Request.Context(), model, accountFilter)
+	accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), model, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, model, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
@@ -203,6 +214,7 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 	dispatchPolicy := dispatchPolicyForModel(model)
+	selectionOpts := geminiNativeSelectionOptions(c, model, dispatchPolicy)
 	inboundEndpoint := geminiCountTokensInboundEndpoint()
 	upstreamEndpoint := "/v1internal:countTokens"
 
@@ -213,7 +225,7 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 	for attempt := 0; ; attempt++ {
 		affinityGuard = auth.SessionAffinityGuard{}
 		account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(
-			c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy,
+			c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts,
 		)
 		if account == nil {
 			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolOpenAI) {
@@ -295,6 +307,10 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			// countTokens 与 generateContent 打到的是同一个 Cloud Code 配额池：漏掉
+			// 这里就等于 429/503 只被计数、从不写模型冷却，被上游限流的账号会立刻在
+			// 下一次选号中重新入选（wireModel 联动与 family 冷却也一并丢失）。
+			h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, model)
 			log.Printf("Gemini native countTokens upstream error (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			if shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy) {
 				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
@@ -425,7 +441,7 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 	}
 
 	accountFilter := antigravityOAuthChannelAccountFilter(model)
-	accountFilter = h.withModelCooldownFilter(c.Request.Context(), model, accountFilter)
+	accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), model, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, model, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
@@ -458,6 +474,7 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 	dispatchPolicy := dispatchPolicyForModel(model)
+	selectionOpts := geminiNativeSelectionOptions(c, model, dispatchPolicy)
 	inboundEndpoint := geminiInboundEndpoint(stream)
 	upstreamEndpoint := antigravityUpstreamEndpoint(stream)
 
@@ -468,7 +485,7 @@ func (h *Handler) handleGeminiGenerateContent(c *gin.Context, model string, rawB
 	for attempt := 0; ; attempt++ {
 		affinityGuard = auth.SessionAffinityGuard{}
 		account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(
-			c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy,
+			c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts,
 		)
 		if account == nil {
 			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolGemini) {

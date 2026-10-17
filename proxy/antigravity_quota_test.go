@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
+	"github.com/gin-gonic/gin"
 )
 
 const antigravityQuotaExhaustedBody = `{"error":{"code":429,"message":"You have exhausted your capacity on this model.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED","domain":"cloudcode-pa.googleapis.com","metadata":{"model":"gemini-3.7-flash-tiered"}},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"4m50s"}]}}`
@@ -241,5 +244,326 @@ func TestApplyAntigravityCooldownPrefersRetryAfterHeaderOverTheShortBackOff(t *t
 	decision := applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityUnclassifiedRateLimitBody), resp, "gemini-3.7-flash-high")
 	if decision.Cooldown < 11*time.Second || decision.Cooldown > 12*time.Second {
 		t.Fatalf("cooldown = %s, want the 12s Retry-After header instead of the short back-off", decision.Cooldown)
+	}
+}
+
+// TestApplyAntigravityCooldownCoolsSharedWireModel 覆盖别名冷却联动：
+// gemini-3.8-flash-low/medium/high 共用上游 backing gemini-3.8-flash-tiered，
+// high 被限流后必须同时冷却 wire 模型，否则 low/medium 仍会选中同一账号并继续
+// 收集 429。
+func TestApplyAntigravityCooldownCoolsSharedWireModel(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	account := &auth.Account{DBID: 7401, UpstreamType: auth.UpstreamAntigravity, AccessToken: "google-token", AntigravityProjectID: "google-project"}
+
+	decision := applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityReasonOnlyRateLimitBody), nil, "gemini-3.8-flash-high")
+	if decision.Model != "gemini-3.8-flash-high" || decision.Reason != "rate_limited_model" {
+		t.Fatalf("decision = %+v", decision)
+	}
+	if !account.IsModelRateLimited("gemini-3.8-flash-high") {
+		t.Fatal("the public tier was not cooled down")
+	}
+	if !account.IsModelRateLimited("gemini-3.8-flash-tiered") {
+		t.Fatal("the shared wire model was not cooled down alongside the public tier")
+	}
+	if remaining, wireRemaining := account.ModelCooldownRemaining("gemini-3.8-flash-high"), account.ModelCooldownRemaining("gemini-3.8-flash-tiered"); remaining <= 0 || wireRemaining > remaining+time.Second {
+		t.Fatalf("wire cooldown %s drifted from the public cooldown %s", wireRemaining, remaining)
+	}
+	// 同 backing 的兄弟档位被拦住，不同 backing 与 Claude 模型不受影响。
+	if !antigravityAccountModelRateLimited(account, "gemini-3.8-flash-low", "gemini-3.8-flash-tiered") {
+		t.Fatal("a sibling tier on the same backing must be blocked")
+	}
+	if antigravityAccountModelRateLimited(account, "gemini-3.6-flash-low", "gemini-3.6-flash-low") {
+		t.Fatal("a different backing must stay schedulable")
+	}
+	if antigravityAccountModelRateLimited(account, "claude-sonnet-4-6", "claude-sonnet-4-6") {
+		t.Fatal("Claude models must stay schedulable")
+	}
+}
+
+// TestApplyAntigravityCooldownCoolsSharedWireModelOnUnstructured429 覆盖非结构化 429：
+// 解析不出 google.rpc 结构的 429 走通用 429 策略，而通用策略只按 public id 落冷却，
+// 同 wire 的兄弟档位仍会选中刚被限流的账号。这里必须补写与 public 同 deadline 的
+// wire 冷却。
+func TestApplyAntigravityCooldownCoolsSharedWireModelOnUnstructured429(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	// Antigravity 账号属于 relay 风格，通用 429 策略默认关闭其模型冷却，
+	// 这里显式打开才能观察到 wire 补写。
+	store.SetModelCooldownSettings(database.ModelCooldownSettings{
+		RelayMode:    database.ModelCooldownModeFixed,
+		RelaySeconds: 60,
+		OAuthMode:    database.ModelCooldownModeFixed,
+		OAuthSeconds: 60,
+	})
+	account := &auth.Account{DBID: 7451, UpstreamType: auth.UpstreamAntigravity, AccessToken: "google-token", AntigravityProjectID: "google-project"}
+
+	if _, ok := parseAntigravityQuotaError(http.StatusTooManyRequests, []byte(`{"error":{"message":"slow down"}}`)); ok {
+		t.Fatal("the body must stay unparseable so the generic 429 path is exercised")
+	}
+	decision := applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(`{"error":{"message":"slow down"}}`), &http.Response{Header: http.Header{}}, "gemini-3.8-flash-high")
+	if decision.Scope != rateLimitScopeModel || decision.Model != "gemini-3.8-flash-high" || decision.ResetAt.IsZero() {
+		t.Fatalf("decision = %+v, want a model-scoped cooldown", decision)
+	}
+	if !account.IsModelRateLimited("gemini-3.8-flash-high") {
+		t.Fatal("the public tier was not cooled down")
+	}
+	if !account.IsModelRateLimited("gemini-3.8-flash-tiered") {
+		t.Fatal("an unstructured 429 must cool the shared wire model alongside the public tier")
+	}
+	if remaining, wireRemaining := account.ModelCooldownRemaining("gemini-3.8-flash-high"), account.ModelCooldownRemaining("gemini-3.8-flash-tiered"); remaining <= 0 || wireRemaining > remaining+time.Second {
+		t.Fatalf("wire cooldown %s drifted from the public cooldown %s", wireRemaining, remaining)
+	}
+	if !antigravityAccountModelRateLimited(account, "gemini-3.8-flash-low", "gemini-3.8-flash-tiered") {
+		t.Fatal("a sibling tier on the same backing must be blocked")
+	}
+	if antigravityAccountModelRateLimited(account, "gemini-3.6-flash-low", "gemini-3.6-flash-low") {
+		t.Fatal("a different backing must stay schedulable")
+	}
+	// 非结构化 429 依旧只记半个惩罚，且事件带上解析出的 wire 模型。
+	if got := account.AntigravityPenalty(time.Now()); got < 0.49 || got > 0.51 {
+		t.Fatalf("penalty = %v, want the unclassified 0.5", got)
+	}
+}
+
+// TestApplyAntigravityCooldownPenaltyWeights 覆盖调度惩罚的事件权重：明确限流
+// 记满，裸 RESOURCE_EXHAUSTED 与非结构化 429 记一半，共享容量与账号配额不记。
+func TestApplyAntigravityCooldownPenaltyWeights(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	newAccount := func(id int64) *auth.Account {
+		return &auth.Account{DBID: id, UpstreamType: auth.UpstreamAntigravity, AccessToken: "google-token", AntigravityProjectID: "google-project"}
+	}
+
+	cases := []struct {
+		name       string
+		statusCode int
+		body       string
+		want       float64
+	}{
+		{"explicit rate limit", http.StatusTooManyRequests, antigravityReasonOnlyRateLimitBody, 1.0},
+		{"bare resource exhausted", http.StatusTooManyRequests, antigravityUnclassifiedRateLimitBody, 0.5},
+		{"unstructured 429", http.StatusTooManyRequests, `{"error":{"message":"slow down"}}`, 0.5},
+		{"quota exhausted", http.StatusTooManyRequests, antigravityQuotaExhaustedBody, 0.0},
+		{"shared model capacity", http.StatusServiceUnavailable, antigravityModelCapacityBody, 0.0},
+	}
+	for _, tc := range cases {
+		account := newAccount(7410)
+		applyAntigravityCooldown(store, account, tc.statusCode, []byte(tc.body), nil, "gemini-3.8-flash-high")
+		if got := account.AntigravityPenalty(time.Now()); math.Abs(got-tc.want) > 0.01 {
+			t.Fatalf("%s penalty = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// 同一账号连续被限流时惩罚累加，首绑避险据此把它压到队尾。
+	account := newAccount(7411)
+	applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityReasonOnlyRateLimitBody), nil, "gemini-3.8-flash-high")
+	applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityUnclassifiedRateLimitBody), nil, "gemini-3.8-flash-high")
+	if got := account.AntigravityPenalty(time.Now()); got < 1.49 || got > 1.51 {
+		t.Fatalf("accumulated penalty = %v, want ~1.5", got)
+	}
+}
+
+// TestApplyAntigravityCooldownAdminProbeSkipsPenalty 覆盖 admin 连通性测试隔离：
+// 冷却照常写入（否则测试按钮探到的限流会被线上流量无视），但不进线上调度惩罚
+// 累加器（否则一次手工测试就会把健康账号挤出首绑）。
+func TestApplyAntigravityCooldownAdminProbeSkipsPenalty(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	probed := &auth.Account{DBID: 7420, UpstreamType: auth.UpstreamAntigravity, AccessToken: "google-token", AntigravityProjectID: "google-project"}
+
+	if !ApplyAntigravityCooldown(store, probed, http.StatusTooManyRequests, []byte(antigravityReasonOnlyRateLimitBody), nil, "gemini-3.8-flash-high") {
+		t.Fatal("the admin probe did not record a cooldown")
+	}
+	if !probed.IsModelRateLimited("gemini-3.8-flash-high") || !probed.IsModelRateLimited("gemini-3.8-flash-tiered") {
+		t.Fatal("the admin probe must keep writing the public and wire model cooldowns")
+	}
+	if got := probed.AntigravityPenalty(time.Now()); got != 0 {
+		t.Fatalf("admin probe penalty = %v, want 0", got)
+	}
+
+	live := &auth.Account{DBID: 7421, UpstreamType: auth.UpstreamAntigravity, AccessToken: "google-token", AntigravityProjectID: "google-project"}
+	applyAntigravityCooldown(store, live, http.StatusTooManyRequests, []byte(antigravityReasonOnlyRateLimitBody), nil, "gemini-3.8-flash-high")
+	if got := live.AntigravityPenalty(time.Now()); got <= 0 {
+		t.Fatalf("live dispatch penalty = %v, want a recorded event", got)
+	}
+}
+
+// TestGeminiNativeCountTokensAppliesModelCooldown 覆盖 native countTokens 的
+// 429 漏路径：该分支过去只计数与排除账号，从不写模型冷却。
+func TestGeminiNativeCountTokensAppliesModelCooldown(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var hits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, antigravityReasonOnlyRateLimitBody)
+	}))
+	defer server.Close()
+	previous := antigravityOAuthEndpointBases
+	antigravityOAuthEndpointBases = []string{server.URL}
+	t.Cleanup(func() { antigravityOAuthEndpointBases = previous })
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	defer store.Stop()
+	store.SetMaxRetries(0)
+	store.SetMaxRateLimitRetries(0)
+	account := &auth.Account{
+		DBID: 7430, UpstreamType: auth.UpstreamAntigravity, AccessToken: "google-token", AntigravityProjectID: "google-project",
+		Models: []string{"gemini-3.7-flash-tiered", "gemini-3.8-flash-tiered"},
+	}
+	store.AddAccount(account)
+
+	handler := NewHandler(store, nil, nil, nil)
+	row := &database.APIKeyRow{ID: 7, Limits: database.APIKeyLimits{UpstreamChannel: database.UpstreamChannelAntigravity}}
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(contextAPIKeyRow, row)
+		c.Next()
+	})
+	router.POST("/v1beta/models/*action", handler.GeminiModelsAction)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-3.8-flash-high:countTokens", strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+
+	if atomic.LoadInt32(&hits) != 1 {
+		t.Fatalf("upstream hits = %d, want one attempt", hits)
+	}
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d body=%s, want the upstream 429 surfaced", rec.Code, rec.Body.String())
+	}
+	if !account.IsModelRateLimited("gemini-3.8-flash-high") {
+		t.Fatal("countTokens 429 did not cool down the public model")
+	}
+	if !account.IsModelRateLimited("gemini-3.8-flash-tiered") {
+		t.Fatal("countTokens 429 did not cool down the shared wire model")
+	}
+	if got := account.AntigravityPenalty(time.Now()); got <= 0 {
+		t.Fatalf("countTokens 429 penalty = %v, want a recorded event", got)
+	}
+}
+
+// antigravityLongRateLimitBody 是 Google 明确告知 290s 恢复窗口的限流：低于
+// antigravityQuotaExhaustedThreshold，因此仍按 rate_limit 分类。
+const antigravityLongRateLimitBody = `{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"RATE_LIMIT_EXCEEDED","metadata":{"model":"gemini-3.8-flash-tiered"}},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"290s"}]}}`
+
+func newAntigravityCooldownTestAccount(id int64) *auth.Account {
+	return &auth.Account{DBID: id, UpstreamType: auth.UpstreamAntigravity, AccessToken: "google-token", AntigravityProjectID: "google-project"}
+}
+
+// TestApplyAntigravityCooldownSharedWireDeadlineNotShortenedByBrieferEvent 覆盖共享
+// wire 冷却的 deadline 单调性：high 收到 290s 的 RATE_LIMIT_EXCEEDED 后，同账号 low
+// 的裸 RESOURCE_EXHAUSTED（5s 回退）只能延长、不能把共享 wire 冷却改短，否则 5s 之后
+// low/medium 又会选中刚被限流的凭据。public 冷却保持既有覆盖语义不变。
+func TestApplyAntigravityCooldownSharedWireDeadlineNotShortenedByBrieferEvent(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	account := newAntigravityCooldownTestAccount(7461)
+
+	long := applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityLongRateLimitBody), nil, "gemini-3.8-flash-high")
+	if long.Cooldown < 280*time.Second {
+		t.Fatalf("long cooldown = %s, want the 290s retry hint", long.Cooldown)
+	}
+	if wireRemaining := account.ModelCooldownRemaining("gemini-3.8-flash-tiered"); wireRemaining < 280*time.Second {
+		t.Fatalf("wire cooldown = %s after the long event, want ~290s", wireRemaining)
+	}
+
+	// 同账号兄弟档位的裸 RESOURCE_EXHAUSTED：只有 5s 的回退窗口。
+	short := applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityUnclassifiedRateLimitBody), nil, "gemini-3.8-flash-low")
+	if short.Cooldown > 10*time.Second {
+		t.Fatalf("short cooldown = %s, want the brief back-off", short.Cooldown)
+	}
+	if wireRemaining := account.ModelCooldownRemaining("gemini-3.8-flash-tiered"); wireRemaining < 60*time.Second {
+		t.Fatalf("wire cooldown = %s after a briefer event, want the longer deadline kept", wireRemaining)
+	}
+	if !antigravityAccountModelRateLimited(account, "gemini-3.8-flash-medium", "gemini-3.8-flash-tiered") {
+		t.Fatal("a sibling tier on the same backing must stay blocked")
+	}
+	// public 冷却保持既有语义：短事件照常覆盖同名 public 冷却，本次改动不触碰。
+	if publicRemaining := account.ModelCooldownRemaining("gemini-3.8-flash-low"); publicRemaining <= 0 || publicRemaining > 10*time.Second {
+		t.Fatalf("public cooldown = %s, want the brief back-off to win on the public key", publicRemaining)
+	}
+}
+
+// TestApplyAntigravityCooldownSharedWireDeadlineExtendsWithLongerEvent 是反向用例：
+// 先短后长必须延长共享 wire 冷却，AtLeast 变体不是「先到先得」。
+func TestApplyAntigravityCooldownSharedWireDeadlineExtendsWithLongerEvent(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	account := newAntigravityCooldownTestAccount(7462)
+
+	first := applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityUnclassifiedRateLimitBody), nil, "gemini-3.8-flash-low")
+	if first.Cooldown > 10*time.Second {
+		t.Fatalf("first cooldown = %s, want the brief back-off", first.Cooldown)
+	}
+	if wireRemaining := account.ModelCooldownRemaining("gemini-3.8-flash-tiered"); wireRemaining > 10*time.Second {
+		t.Fatalf("wire cooldown = %s after the brief event, want ~5s", wireRemaining)
+	}
+
+	applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityLongRateLimitBody), nil, "gemini-3.8-flash-medium")
+	if wireRemaining := account.ModelCooldownRemaining("gemini-3.8-flash-tiered"); wireRemaining < 280*time.Second {
+		t.Fatalf("wire cooldown = %s, want the longer deadline to extend the shared cooldown", wireRemaining)
+	}
+}
+
+// TestApplyAntigravityCooldownGeminiFamilyDeadlineNotShortened 覆盖 Gemini 家族冷却
+// 键：短窗口的 QUOTA_EXHAUSTED 不能把家族冷却改短，家族键仍拦住其它 Gemini 档位。
+func TestApplyAntigravityCooldownGeminiFamilyDeadlineNotShortened(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	account := newAntigravityCooldownTestAccount(7463)
+
+	longBody := strings.Replace(antigravityQuotaExhaustedBody, `"4m50s"`, `"10m"`, 1)
+	applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(longBody), nil, "gemini-3.7-flash-high")
+	if remaining := account.ModelCooldownRemaining(antigravityGeminiFamilyCooldownKey); remaining < 9*time.Minute {
+		t.Fatalf("family cooldown = %s after the long event, want ~10m", remaining)
+	}
+
+	shortBody := strings.Replace(antigravityQuotaExhaustedBody, `"4m50s"`, `"60s"`, 1)
+	applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(shortBody), nil, "gemini-3.6-flash-low")
+	if remaining := account.ModelCooldownRemaining(antigravityGeminiFamilyCooldownKey); remaining < 9*time.Minute {
+		t.Fatalf("family cooldown = %s after a shorter quota window, want the longer deadline kept", remaining)
+	}
+	if !antigravityAccountModelRateLimited(account, "gemini-3.5-pro-high", "gemini-3.5-pro-high") {
+		t.Fatal("the Gemini family cooldown must keep blocking other Gemini tiers")
+	}
+}
+
+// TestApplyAntigravityCooldownUnstructured429KeepsLongerWireDeadline 覆盖非结构化 429
+// 补写 wire 冷却的同一约束：通用 429 策略给出的较短 deadline 不得覆盖同账号上更长的
+// 共享 wire 冷却。
+func TestApplyAntigravityCooldownUnstructured429KeepsLongerWireDeadline(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	store.SetModelCooldownSettings(database.ModelCooldownSettings{
+		RelayMode:    database.ModelCooldownModeFixed,
+		RelaySeconds: 60,
+		OAuthMode:    database.ModelCooldownModeFixed,
+		OAuthSeconds: 60,
+	})
+	account := newAntigravityCooldownTestAccount(7464)
+
+	// 先由 high 的长限流把共享 wire 冷却写到 ~290s。
+	if _, ok := parseAntigravityQuotaError(http.StatusTooManyRequests, []byte(antigravityLongRateLimitBody)); !ok {
+		t.Fatal("the long rate limit body must stay parseable")
+	}
+	applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityLongRateLimitBody), nil, "gemini-3.8-flash-high")
+
+	if _, ok := parseAntigravityQuotaError(http.StatusTooManyRequests, []byte(`{"error":{"message":"slow down"}}`)); ok {
+		t.Fatal("the body must stay unparseable so the generic 429 path is exercised")
+	}
+	decision := applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(`{"error":{"message":"slow down"}}`), &http.Response{Header: http.Header{}}, "gemini-3.8-flash-low")
+	if decision.ResetAt.IsZero() {
+		t.Fatalf("decision = %+v, want the generic 429 policy to record a cooldown", decision)
+	}
+	if wireRemaining := account.ModelCooldownRemaining("gemini-3.8-flash-tiered"); wireRemaining < 120*time.Second {
+		t.Fatalf("wire cooldown = %s after an unstructured 429, want the longer deadline kept", wireRemaining)
+	}
+	if !antigravityAccountModelRateLimited(account, "gemini-3.8-flash-medium", "gemini-3.8-flash-tiered") {
+		t.Fatal("a sibling tier on the same backing must stay blocked")
 	}
 }

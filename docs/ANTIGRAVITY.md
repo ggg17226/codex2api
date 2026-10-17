@@ -99,6 +99,18 @@ When creating or editing a Codex2API downstream API key, choose **Antigravity** 
 
 Account groups are channel-isolated: an Antigravity account can only join an Antigravity group.
 
+## Balanced affinity switch
+
+First binding and fresh session selection bias Antigravity candidates by concurrency occupancy, used quota, and the account's recent rate-limit penalty, so a credential Google just throttled sinks to the back of the queue while healthy ones keep serving new sessions.
+
+```
+ANTIGRAVITY_BALANCED_AFFINITY=false
+```
+
+The switch is on by default. `0`, `false`, `off`, `none`, and `no` (case-insensitive) turn the weighting off and restore plain round-robin; any other value keeps it on. It is read once when the process starts, so changing it requires a restart.
+
+Cooldown correctness is independent of this switch and always applies: the public and shared wire keys are cooled together (the Gemini-family key is added when the quota bucket is exhausted), a shared wire/family deadline is never shortened by a briefer event on the same account, and cooldowns written by another instance are honoured during selection. Entries whose candidate pool excludes Antigravity accounts (`/v1/responses/compact`, native remote compaction, the `/v1/responses` WebSocket upgrade path) never apply the weighting, even behind an Antigravity key.
+
 ## Supported gateway endpoints
 
 Antigravity inference is admitted through `/v1/responses`, `/v1/chat/completions`, and `/v1/messages`; its models are exposed through `/v1/models` and the Codex model manifest. Chat and Messages translate their inbound body into a Responses payload before dispatch, which is exactly what the `v1internal` adapter consumes, so all three transports share one admission gate and one adapter. `/v1/responses/compact` still excludes Antigravity accounts because no compaction adapter exists, and the official Codex executors reject Antigravity credentials before any network request as a provider-boundary safeguard.

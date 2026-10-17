@@ -456,11 +456,11 @@ var dispatchAccountWaitTimeout = 30 * time.Second
 // waitForRetryAccountAvailable keeps one queue admission for the normal
 // 30-second wait, including continuous-retry SSE/WebSocket heartbeats.
 func (h *Handler) waitForRetryAccountAvailable(ctx context.Context, affinityKey string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, preserveBinding bool, policy auth.DispatchPolicy) (*auth.Account, string, error) {
-	account, proxyURL, _, err := h.waitForRetryAccountAvailableWithGuard(ctx, affinityKey, apiKeyID, exclude, filter, preserveBinding, policy)
+	account, proxyURL, _, err := h.waitForRetryAccountAvailableWithGuard(ctx, affinityKey, apiKeyID, exclude, filter, preserveBinding, auth.SelectionOptions{Policy: policy})
 	return account, proxyURL, err
 }
 
-func (h *Handler) waitForRetryAccountAvailableWithGuard(ctx context.Context, affinityKey string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, preserveBinding bool, policy auth.DispatchPolicy) (*auth.Account, string, auth.SessionAffinityGuard, error) {
+func (h *Handler) waitForRetryAccountAvailableWithGuard(ctx context.Context, affinityKey string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, preserveBinding bool, opts auth.SelectionOptions) (*auth.Account, string, auth.SessionAffinityGuard, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -482,7 +482,7 @@ func (h *Handler) waitForRetryAccountAvailableWithGuard(ctx context.Context, aff
 			return step, nil
 		}
 	}
-	account, proxyURL, guard, err := h.store.WaitForDispatchAvailable(ctx, affinityKey, dispatchAccountWaitTimeout, apiKeyID, exclude, filter, preserveBinding, policy, heartbeat)
+	account, proxyURL, guard, err := h.store.WaitForDispatchAvailableForProvider(ctx, affinityKey, dispatchAccountWaitTimeout, apiKeyID, exclude, filter, opts, preserveBinding, heartbeat)
 	account, proxyURL = guardRetryAccountContext(ctx, h.store.Release, account, proxyURL)
 	if account == nil {
 		guard = auth.SessionAffinityGuard{}
@@ -498,25 +498,30 @@ func (h *Handler) nextRetryAccountForSessionWithDispatch(ctx context.Context, af
 	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, false, policy)
 }
 
-func (h *Handler) nextRetryAccountForSessionWithDispatchGuard(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string, auth.SessionAffinityGuard, error) {
-	return h.nextRetryAccountWithGuard(ctx, affinityKey, apiKeyID, exclusions, filter, false, policy)
+func (h *Handler) nextRetryAccountForSessionWithDispatchGuard(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, opts auth.SelectionOptions) (*auth.Account, string, auth.SessionAffinityGuard, error) {
+	return h.nextRetryAccountWithGuard(ctx, affinityKey, apiKeyID, exclusions, filter, false, opts)
 }
 
 func (h *Handler) nextRetryAccountForSessionWithGuard(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter) (*auth.Account, string, auth.SessionAffinityGuard, error) {
-	return h.nextRetryAccountWithGuard(ctx, affinityKey, apiKeyID, exclusions, filter, false, auth.DispatchPolicyStandard)
+	return h.nextRetryAccountWithGuard(ctx, affinityKey, apiKeyID, exclusions, filter, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 }
 
 func (h *Handler) nextRetryAccountForContinuation(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter) (*auth.Account, string) {
 	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, true, auth.DispatchPolicyStandard)
 }
 
-func (h *Handler) nextRetryAccountForContinuationWithDispatch(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string, error) {
-	account, proxyURL, _, err := h.nextRetryAccountWithGuard(ctx, affinityKey, apiKeyID, exclusions, filter, true, policy)
+// nextRetryAccountForContinuationWithSelection 是续链（preserveBinding=true）重试的
+// SelectionOptions 变体：续链虽然只认已绑定的账号，但选号实现仍需要 Provider / Policy
+// 才能走对渠道分支。传 policy-only 的 SelectionOptions 会让 auto 渠道下的 Antigravity
+// 续链请求丢掉加权避险上下文。候选池已显式排除 Antigravity 的入口（compact 执行器 /
+// native remote compaction）例外，见 selectionOptionsForCandidatePool。
+func (h *Handler) nextRetryAccountForContinuationWithSelection(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, opts auth.SelectionOptions) (*auth.Account, string, error) {
+	account, proxyURL, _, err := h.nextRetryAccountWithGuard(ctx, affinityKey, apiKeyID, exclusions, filter, true, opts)
 	return account, proxyURL, err
 }
 
 func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, preserveBinding bool, policy auth.DispatchPolicy) (*auth.Account, string) {
-	account, proxyURL, _, _ := h.nextRetryAccountWithGuard(ctx, affinityKey, apiKeyID, exclusions, filter, preserveBinding, policy)
+	account, proxyURL, _, _ := h.nextRetryAccountWithGuard(ctx, affinityKey, apiKeyID, exclusions, filter, preserveBinding, auth.SelectionOptions{Policy: policy})
 	return account, proxyURL
 }
 
@@ -535,13 +540,14 @@ func selectionFilterWithContext(ctx context.Context, filter auth.AccountFilter) 
 	}
 }
 
-func (h *Handler) nextRetryAccountWithGuard(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, preserveBinding bool, policy auth.DispatchPolicy) (*auth.Account, string, auth.SessionAffinityGuard, error) {
+func (h *Handler) nextRetryAccountWithGuard(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, preserveBinding bool, opts auth.SelectionOptions) (*auth.Account, string, auth.SessionAffinityGuard, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if h == nil || h.store == nil {
 		return nil, "", auth.SessionAffinityGuard{}, nil
 	}
+	policy := opts.Policy
 	ctx, cancelSelection := context.WithTimeout(ctx, accountSelectionTimeout)
 	defer cancelSelection()
 	filter = selectionFilterWithContext(ctx, filter)
@@ -554,9 +560,11 @@ func (h *Handler) nextRetryAccountWithGuard(ctx context.Context, affinityKey str
 		var stickyProxyURL string
 		var guard auth.SessionAffinityGuard
 		if preserveBinding {
-			account, stickyProxyURL = h.store.NextForContinuationWithDispatch(affinityKey, apiKeyID, exclude, filter, policy)
+			// 续链同样带上 SelectionOptions：Provider 为空时与 policy-only 行为一致，
+			// 携带渠道时底层选号（含容量借用 / 首次绑定分支）不会丢掉加权避险上下文。
+			account, stickyProxyURL = h.store.NextForContinuationWithDispatchForProvider(opts, affinityKey, apiKeyID, exclude, filter)
 		} else {
-			account, stickyProxyURL, guard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, exclude, filter, policy)
+			account, stickyProxyURL, guard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, exclude, filter, opts)
 		}
 		if account != nil {
 			if ctx.Err() != nil {
@@ -578,7 +586,7 @@ func (h *Handler) nextRetryAccountWithGuard(ctx context.Context, affinityKey str
 		// retry interval/backoff still paces the next upstream attempt.
 		if !h.onlyResettableExclusionsBlock(affinityKey, apiKeyID, exclusions, exclude, filter, preserveBinding, policy) {
 			var admissionErr error
-			account, stickyProxyURL, guard, admissionErr = h.waitForRetryAccountAvailableWithGuard(ctx, affinityKey, apiKeyID, exclude, filter, preserveBinding, policy)
+			account, stickyProxyURL, guard, admissionErr = h.waitForRetryAccountAvailableWithGuard(ctx, affinityKey, apiKeyID, exclude, filter, preserveBinding, opts)
 			if account != nil {
 				if ctx.Err() != nil {
 					h.store.Release(account)

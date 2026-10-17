@@ -110,15 +110,54 @@ func (h *Handler) nextAccountForSessionWithFilter(sessionID string, apiKeyID int
 }
 
 func (h *Handler) nextAccountForSessionWithDispatch(sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string) {
-	account, proxyURL, _ := h.nextAccountForSessionWithDispatchGuard(sessionID, apiKeyID, exclude, filter, policy)
+	account, proxyURL, _ := h.nextAccountForSessionWithDispatchGuard(sessionID, apiKeyID, exclude, filter, auth.SelectionOptions{Policy: policy})
 	return account, proxyURL
 }
 
-func (h *Handler) nextAccountForSessionWithDispatchGuard(sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string, auth.SessionAffinityGuard) {
+func (h *Handler) nextAccountForSessionWithDispatchGuard(sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, opts auth.SelectionOptions) (*auth.Account, string, auth.SessionAffinityGuard) {
 	if h == nil || h.store == nil {
 		return nil, "", auth.SessionAffinityGuard{}
 	}
-	return h.store.NextForSessionWithDispatchGuard(sessionID, apiKeyID, exclude, filter, policy)
+	return h.store.NextForSessionWithDispatchGuardForProvider(opts, sessionID, apiKeyID, exclude, filter)
+}
+
+// selectionOptionsForRequest 依据当前请求渠道与 public model 组装选号上下文：Antigravity
+// 渠道请求据此在 Store 侧启用首绑 / Fresh 加权避险，其余渠道 Provider 非 antigravity，
+// Store 走既有选号逻辑，行为不变。
+func selectionOptionsForRequest(c *gin.Context, model string, policy auth.DispatchPolicy) auth.SelectionOptions {
+	return selectionOptionsForRequestWithProvider(c, model, policy, "")
+}
+
+// selectionOptionsForRequestWithProvider 与 selectionOptionsForRequest 相同，只是用
+// forceProvider 覆盖请求渠道作为选号渠道（forceProvider 为空表示沿用请求渠道）。
+// native Gemini（generateContent / countTokens）的候选池被 antigravityOAuthChannelAccountFilter
+// 硬限定为 Antigravity OAuth：auto 渠道 Key 走到这两个入口时 requestUpstreamChannel 为空，
+// 不覆盖就会把加权避险整个关掉，所以这两个入口按候选池的真实归属强制
+// Provider=antigravity。
+func selectionOptionsForRequestWithProvider(c *gin.Context, model string, policy auth.DispatchPolicy, forceProvider string) auth.SelectionOptions {
+	provider := strings.TrimSpace(forceProvider)
+	if provider == "" {
+		provider = requestUpstreamChannel(c)
+	}
+	return auth.SelectionOptions{
+		Provider: provider,
+		Model:    strings.TrimSpace(model),
+		Policy:   policy,
+	}
+}
+
+// selectionOptionsForCandidatePool 组装选号上下文，并由入口声明候选池是否已显式排除
+// Antigravity 账号（antigravityExcluded）。
+//
+// 排除时只保留 Policy、不带 Provider：这类入口（compact 执行器、native remote
+// compaction）的候选只剩 Codex 官方与 relay 账号，而 Antigravity 渠道 Key 打到这些
+// 入口时 requestUpstreamChannel 仍是 antigravity，沿用请求渠道就会让 Store 侧对
+// Codex relay 候选套用 Antigravity 加权打分，并绕过 spread / HRW 一致哈希。
+func selectionOptionsForCandidatePool(c *gin.Context, model string, policy auth.DispatchPolicy, antigravityExcluded bool) auth.SelectionOptions {
+	if antigravityExcluded {
+		return auth.SelectionOptions{Policy: policy}
+	}
+	return selectionOptionsForRequest(c, model, policy)
 }
 
 func dispatchPolicyForModel(model string) auth.DispatchPolicy {
@@ -133,6 +172,46 @@ func (h *Handler) withModelCooldownFilter(ctx context.Context, model string, fil
 		return filter
 	}
 	return h.store.WithModelCooldownFilterContext(ctx, model, filter)
+}
+
+// antigravityRequestCooldownKeys 解析 public model 对应的 wireModel 与（Gemini 家族）
+// 共享 familyKey，供跨实例三键冷却检查使用。wireModel 取自模型目录
+// （AntigravityWireModelID），与 antigravityResolvePublicModelForAccount 对受支持账号返回
+// 的 wire 完全一致；账号是否具备该 wire 支撑已由 antigravityChannelAccountFilter 单独把关，
+// 这里只负责冷却键。非 Gemini 模型的 familyKey 为空串。
+func antigravityRequestCooldownKeys(model string) (wireModel string, familyKey string) {
+	wireModel, _ = AntigravityWireModelID(model)
+	if antigravityIsGeminiModel(model) || antigravityIsGeminiModel(wireModel) {
+		familyKey = antigravityGeminiFamilyCooldownKey
+	}
+	return wireModel, familyKey
+}
+
+// withRequestModelCooldownFilter 应用跨实例模型冷却过滤器，按下游 Key 的渠道限定分三档：
+//   - antigravity：额外解析 public model 对应的 wireModel 及（Gemini 家族）共享 familyKey，
+//     用 WithAntigravityCooldownFilterContext 对三个 key 一并做跨实例检查——任一 key 由其它
+//     实例写入的冷却都能在本实例选号时过滤掉该账号，闭合「本地内存已限流但跨实例缓存未拦截」
+//     的缺口；
+//   - auto（渠道未限定）：候选池里既可能有 Antigravity 账号（native Gemini 入口硬限定为
+//     Antigravity OAuth，Responses / Chat / Messages 也允许），也可能有其它渠道账号，改用
+//     WithAntigravityAwareCooldownFilterContext 按候选账号类型分别取三键 / 单键检查——
+//     Antigravity 账号同样能看到跨实例 wire / family 冷却，非 Antigravity 账号行为不变；
+//   - 其它显式渠道（codex / grok / claude）：候选池不含 Antigravity 账号，沿用单一
+//     publicModel 检查，行为不变。
+func (h *Handler) withRequestModelCooldownFilter(c *gin.Context, ctx context.Context, model string, filter auth.AccountFilter) auth.AccountFilter {
+	if h == nil || h.store == nil {
+		return filter
+	}
+	switch requestUpstreamChannel(c) {
+	case database.UpstreamChannelAntigravity:
+		wireModel, familyKey := antigravityRequestCooldownKeys(model)
+		return h.store.WithAntigravityCooldownFilterContext(ctx, model, wireModel, familyKey, filter)
+	case database.UpstreamChannelAuto:
+		wireModel, familyKey := antigravityRequestCooldownKeys(model)
+		return h.store.WithAntigravityAwareCooldownFilterContext(ctx, model, wireModel, familyKey, filter)
+	default:
+		return h.store.WithModelCooldownFilterContext(ctx, model, filter)
+	}
 }
 
 func (h *Handler) shouldUseWebsocketForHTTP() bool {
@@ -4046,7 +4125,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	} else {
 		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
 	}
-	accountFilter = h.withModelCooldownFilter(c.Request.Context(), effectiveModel, accountFilter)
+	accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), effectiveModel, accountFilter)
 	if continuationUnavailable {
 		accountFilter = responsesContinuationRelayFilter(accountFilter)
 	}
@@ -4100,6 +4179,10 @@ func (h *Handler) Responses(c *gin.Context) {
 
 	capacityShedRetries := map[int64]int{}
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
+	// native remote compaction 的候选池被 accountFilterForInlineCompactionModelWithOriginal
+	// 硬排除 Antigravity 账号，此时不带渠道，避免 Antigravity 渠道 Key 对 Codex relay
+	// 候选套用加权避险；普通 Responses 请求的候选池仍可能含 Antigravity 账号，保持渠道。
+	selectionOpts := selectionOptionsForCandidatePool(c, effectiveModel, dispatchPolicy, nativeRemoteCompactionV2)
 	var affinityGuard auth.SessionAffinityGuard
 	var selectionErr error
 	grokQualityAttempts := 0
@@ -4113,11 +4196,12 @@ func (h *Handler) Responses(c *gin.Context) {
 			if account != nil {
 				stickyProxyURL = account.GetProxyURL()
 			} else if continuationUnavailable && !relayContinuationAttempted {
-				account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
+				account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
 			} else if turnContinuationPinned {
-				account, stickyProxyURL, selectionErr = h.nextRetryAccountForContinuationWithDispatch(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+				// 续链重试同样传 SelectionOptions，避免重试把选号上下文丢掉。
+				account, stickyProxyURL, selectionErr = h.nextRetryAccountForContinuationWithSelection(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
 			} else {
-				account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+				account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
 			}
 		}
 		if account == nil {
@@ -6055,7 +6139,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// compact 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
 	accountFilter := accountFilterForCompactResponsesModelWithOriginal(routingModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
-	accountFilter = h.withModelCooldownFilter(c.Request.Context(), effectiveModel, accountFilter)
+	accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), effectiveModel, accountFilter)
 	accountFilter = excludeClaudeAccountsFilter(accountFilter)
 	if continuationUnavailable {
 		accountFilter = responsesContinuationRelayFilter(accountFilter)
@@ -6090,6 +6174,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	relayContinuationAttempted := false
 
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
+	// compact 执行器的候选池被 accountFilterForCompactResponsesModelWithOriginal 硬排除
+	// Antigravity 账号，因此不带渠道：Antigravity 渠道 Key 在这里也不该对 Codex relay
+	// 候选套用加权避险。
+	selectionOpts := selectionOptionsForCandidatePool(c, effectiveModel, dispatchPolicy, true)
 	for attempt := 0; ; attempt++ {
 		var account *auth.Account
 		var stickyProxyURL string
@@ -6102,7 +6190,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			}
 		}
 		if account == nil {
-			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
+			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
 		}
 		if account == nil {
 			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
@@ -6129,7 +6217,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
 				return
 			}
-			account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+			account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
 			if account == nil {
 				if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolResponses) {
 					return
@@ -6905,7 +6993,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// /v1/chat/completions 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发（issue #181）。
 	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
-	accountFilter = h.withModelCooldownFilter(c.Request.Context(), effectiveModel, accountFilter)
+	accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), effectiveModel, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 	accountFilter = excludeClaudeAccountsFilter(accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
@@ -6944,6 +7032,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	capacityShedRetries := map[int64]int{}
 	dispatchPolicy := dispatchPolicyForModel(effectiveModel)
+	selectionOpts := selectionOptionsForRequest(c, effectiveModel, dispatchPolicy)
 	var affinityGuard auth.SessionAffinityGuard
 	var selectionErr error
 	grokQualityAttempts := 0
@@ -6951,7 +7040,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
-			account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+			account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
 		}
 		if account == nil {
 			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolChat) {

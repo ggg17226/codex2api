@@ -308,11 +308,83 @@ func antigravityNonPenalizingUpstreamFailure(account *auth.Account, statusCode i
 // fall back to the generic relay-style cooldown policy, and a recognised body
 // that carries no hint at all is backed off briefly instead of being charged
 // the full default bench.
+//
+// Live dispatch also feeds the scheduling penalty accumulator through here (see
+// auth.RecordAntigravityRateLimitEvent); admin connectivity probes reuse the
+// same cooldown mapping without that accounting via ApplyAntigravityCooldown.
 func applyAntigravityCooldown(store *auth.Store, account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
+	return applyAntigravityCooldownWithPenalty(store, account, statusCode, body, resp, model, true)
+}
+
+// antigravityRateLimitEvent normalises one 429/503 observation into the event
+// shape the fresh-selection penalty understands. parsed is false when the body
+// carried no recognisable google.rpc signal at all.
+func antigravityRateLimitEvent(statusCode int, model, wireModel string, quota antigravityQuotaError, parsed bool, resetAt time.Time) auth.AntigravityRateLimitEvent {
+	event := auth.AntigravityRateLimitEvent{
+		StatusCode:  statusCode,
+		PublicModel: strings.TrimSpace(model),
+		WireModel:   strings.TrimSpace(wireModel),
+		ResetAt:     resetAt,
+		ObservedAt:  time.Now(),
+	}
+	if antigravityIsGeminiModel(event.PublicModel) || antigravityIsGeminiModel(event.WireModel) {
+		event.Family = antigravityGeminiFamilyCooldownKey
+	}
+	if !parsed {
+		// A 429 with no google.rpc detail says nothing about this credential,
+		// so it is charged half a penalty instead of a full one.
+		event.Kind = "unstructured_rate_limit"
+		event.Scope = auth.AGScopeUnknown
+		event.Weight = auth.AntigravityPenaltyWeightUnclassifiedRateLimit
+		return event
+	}
+	event.Kind = string(quota.Kind)
+	switch quota.Kind {
+	case antigravityQuotaKindModelCapacity:
+		// A model-wide shortage is Google's problem; switching accounts cannot
+		// help, so the scheduler must not steer away from this credential.
+		event.Scope = auth.AGScopeSharedCapacity
+		event.Weight = auth.AntigravityPenaltyWeightNone
+	case antigravityQuotaKindQuotaExhausted:
+		// Already covered by the long per-model cooldown plus the Gemini
+		// family cooldown; a short-term penalty would only double-count it.
+		event.Scope = auth.AGScopeAccountQuota
+		event.Weight = auth.AntigravityPenaltyWeightNone
+	default:
+		event.Scope = auth.AGScopeModelRateLimit
+		if quota.Reason != "" || quota.HasRetryDelay {
+			event.Weight = auth.AntigravityPenaltyWeightExplicitRateLimit
+		} else {
+			event.Weight = auth.AntigravityPenaltyWeightUnclassifiedRateLimit
+		}
+	}
+	return event
+}
+
+func applyAntigravityCooldownWithPenalty(store *auth.Store, account *auth.Account, statusCode int, body []byte, resp *http.Response, model string, recordPenalty bool) codex429Decision {
 	quota, ok := parseAntigravityQuotaError(statusCode, body)
 	if !ok {
 		if statusCode == http.StatusTooManyRequests {
-			return Apply429Cooldown(store, account, body, resp, model)
+			decision := Apply429Cooldown(store, account, body, resp, model)
+			// 非结构化 429（Cloud Code 负载抑制时只回 {"code":429,"status":
+			// "RESOURCE_EXHAUSTED"}）走通用 429 策略，而通用策略只按 public id 落冷却。
+			// 多个公开档位共用一个 wire 模型时，同 wire 的兄弟档位仍会被选中，账号带着
+			// 刚被限流的凭据再次上游。这里补写 wire 冷却；解析不到 wire（非目录模型 /
+			// 账号不具备该 wire）时跳过。wire 是共享冷却键，用 AtLeast 变体写入，避免本次
+			// 更短的 deadline 把同账号上更长的 wire 冷却改短。
+			wireModel := ""
+			if store != nil && account != nil && decision.Model != "" && !decision.ResetAt.IsZero() {
+				if wire, resolved := antigravityResolvePublicModelForAccount(account, decision.Model); resolved {
+					wireModel = strings.TrimSpace(wire)
+				}
+				if wireModel != "" && !strings.EqualFold(wireModel, decision.Model) {
+					store.MarkModelCooldownUntilAtLeast(account, wireModel, decision.Reason, decision.ResetAt)
+				}
+			}
+			if recordPenalty {
+				auth.RecordAntigravityRateLimitEvent(account, antigravityRateLimitEvent(statusCode, decision.Model, wireModel, antigravityQuotaError{}, false, decision.ResetAt))
+			}
+			return decision
 		}
 		return codex429Decision{}
 	}
@@ -367,8 +439,24 @@ func applyAntigravityCooldown(store *auth.Store, account *auth.Account, statusCo
 		decision.ResetAt = marked.ResetAt
 		decision.Cooldown = time.Until(marked.ResetAt)
 	}
+	// Public tiers may share one upstream backing (gemini-3.8-flash-low/medium/
+	// high all ride gemini-3.8-flash-tiered). Cooling only the public id leaves
+	// the sibling tiers selectable on the very account the upstream just
+	// throttled, so the wire id is cooled with the same deadline.
+	//
+	// wire 与 family 都是同账号上的共享冷却键，会被多个公开档位的事件并发写入，因此
+	// 用 AtLeast 变体：high 的 290s RATE_LIMIT_EXCEEDED 之后，同账号 low 的 5s 裸
+	// RESOURCE_EXHAUSTED 只能延长、不能把共享 deadline 改短，否则短窗口一过兄弟档位
+	// 又会选中刚被限流的凭据。public 保持既有覆盖语义不变。
+	wireModel, _ := antigravityResolvePublicModelForAccount(account, decision.Model)
+	if wireModel != "" && !strings.EqualFold(wireModel, decision.Model) {
+		store.MarkModelCooldownUntilAtLeast(account, wireModel, decision.Reason, decision.ResetAt)
+	}
 	if quota.Kind == antigravityQuotaKindQuotaExhausted && (antigravityIsGeminiModel(decision.Model) || antigravityIsGeminiModel(quota.Model)) {
-		store.MarkModelCooldownUntil(account, antigravityGeminiFamilyCooldownKey, decision.Reason, resetAt)
+		store.MarkModelCooldownUntilAtLeast(account, antigravityGeminiFamilyCooldownKey, decision.Reason, decision.ResetAt)
+	}
+	if recordPenalty {
+		auth.RecordAntigravityRateLimitEvent(account, antigravityRateLimitEvent(statusCode, decision.Model, wireModel, quota, true, decision.ResetAt))
 	}
 	return decision
 }
@@ -378,10 +466,15 @@ func applyAntigravityCooldown(store *auth.Store, account *auth.Account, statusCo
 // sized from Google's structured retry hint, with the generic 429 policy as
 // fallback. It reports whether a cooldown was actually recorded so callers can
 // classify the failure as rate limiting instead of a broken account.
+//
+// A connectivity probe is not user traffic: it keeps the cooldown write but
+// stays out of the live scheduling penalty accumulator, otherwise one manual
+// test button would bias fresh selection away from an otherwise healthy
+// account.
 func ApplyAntigravityCooldown(store *auth.Store, account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) bool {
 	if statusCode != http.StatusTooManyRequests && statusCode != http.StatusServiceUnavailable {
 		return false
 	}
-	decision := applyAntigravityCooldown(store, account, statusCode, body, resp, model)
+	decision := applyAntigravityCooldownWithPenalty(store, account, statusCode, body, resp, model, false)
 	return !decision.ResetAt.IsZero()
 }

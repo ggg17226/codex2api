@@ -36,7 +36,7 @@ func TestSelectionCancellationStopsInitialScan(t *testing.T) {
 					return false
 				}
 				h := &Handler{store: store}
-				account, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), filter, false, auth.DispatchPolicyStandard)
+				account, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), filter, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 				if account != nil {
 					store.Release(account)
 					t.Fatal("selected an account after cancellation")
@@ -75,7 +75,7 @@ func TestSelectionBudgetIncludesInitialScan(t *testing.T) {
 			return false
 		}
 		h := &Handler{store: store}
-		account, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, newRetryAccountExclusions(), filter, false, auth.DispatchPolicyStandard)
+		account, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, newRetryAccountExclusions(), filter, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 		if account != nil || !errors.Is(err, context.DeadlineExceeded) || calls != 2 {
 			t.Fatalf("selection returned account=%v, error=%v, filter calls=%d", account, err, calls)
 		}
@@ -94,7 +94,7 @@ func TestSelectionSuccessPreservesRequestLifetime(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		h := &Handler{store: store}
-		got, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), nil, false, auth.DispatchPolicyStandard)
+		got, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 		if err != nil || got != account {
 			t.Fatalf("selection = %v, %v", got, err)
 		}
@@ -113,7 +113,7 @@ func TestSelectionDeadlineStopsPoolWait(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	account, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), nil, false, auth.DispatchPolicyStandard)
+	account, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 	if account != nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("selection returned account=%v, error=%v", account, err)
 	}
@@ -145,7 +145,7 @@ func TestSelectionResetsRequestExclusionsCoveringWholePool(t *testing.T) {
 
 				h := &Handler{store: store}
 				start := time.Now()
-				got, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.DispatchPolicyStandard)
+				got, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 				if err != nil || got != account {
 					t.Fatalf("selection = %v, %v; want the %s-excluded account after reset", got, err, kind)
 				}
@@ -177,7 +177,7 @@ func TestSelectionTransientResetKeepsHardExclusions(t *testing.T) {
 
 			h := &Handler{store: store}
 			for i := 0; i < 3; i++ {
-				got, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.DispatchPolicyStandard)
+				got, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 				if err != nil || got != transient {
 					t.Fatalf("round %d selection = %v, %v; want only the transient account", i, got, err)
 				}
@@ -200,7 +200,7 @@ func TestSelectionTransientResetKeepsAccountCooldown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	h := &Handler{store: store}
-	got, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, exclusions, nil, false, auth.DispatchPolicyStandard)
+	got, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, exclusions, nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 	if got != nil {
 		store.Release(got)
 		t.Fatal("transient reset bypassed the account cooldown")
@@ -223,7 +223,7 @@ func TestSelectionStillWaitsForSaturatedCandidate(t *testing.T) {
 	exclusions.MarkTransient(failed.DBID)
 
 	h := &Handler{store: store}
-	held, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.DispatchPolicyStandard)
+	held, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 	if err != nil || held != busy {
 		t.Fatalf("setup selection = %v, %v", held, err)
 	}
@@ -233,7 +233,7 @@ func TestSelectionStillWaitsForSaturatedCandidate(t *testing.T) {
 		store.Release(held)
 		close(released)
 	}()
-	got, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.DispatchPolicyStandard)
+	got, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 	<-released
 	if err != nil || got != busy {
 		t.Fatalf("selection = %v, %v; want the released saturated account", got, err)

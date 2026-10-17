@@ -194,11 +194,17 @@ type Account struct {
 	antigravityQuotaObservedAt  time.Time
 	antigravityQuotaValid       bool
 	antigravityModelMaxOutput   map[string]int
-	BaseURL                     string
-	APIKey                      string
-	Models                      []string
-	ModelMapping                string
-	CodexClientMetadataMode     string
+	// antigravityPenalty 是 Antigravity 首绑/Fresh 选号避险使用的近期限流惩罚：
+	// 进程内、指数衰减、不落库（见 antigravity_ratelimit.go）。它只影响「下一个
+	// 新会话优先选谁」，不参与冷却判定，也不改变任何既有绑定语义。
+	// antigravityPenaltyAt 是最近一次记录惩罚的时刻。两者均受 a.mu 保护。
+	antigravityPenalty      float64
+	antigravityPenaltyAt    time.Time
+	BaseURL                 string
+	APIKey                  string
+	Models                  []string
+	ModelMapping            string
+	CodexClientMetadataMode string
 	// CodexPassthroughMode 是 OpenAI Responses 中转账号的 Codex 身份透传档位
 	// （off / auto / always），见 codex passthrough 常量定义。
 	CodexPassthroughMode string
@@ -3097,19 +3103,22 @@ func normalizeModelCooldownKey(model string) string {
 	return strings.ToLower(strings.TrimSpace(model))
 }
 
-func (a *Account) SetModelCooldownUntil(model, reason string, resetAt time.Time) ModelCooldown {
+// normalizeModelCooldownArgs 归一化冷却键与原因。key 为空或 resetAt 为零值时返回
+// ok=false，调用方保持既有「什么都不写」的语义。
+func normalizeModelCooldownArgs(model, reason string, resetAt time.Time) (string, string, bool) {
 	key := normalizeModelCooldownKey(model)
 	if key == "" || resetAt.IsZero() {
-		return ModelCooldown{}
+		return "", "", false
 	}
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "rate_limited"
 	}
-	now := time.Now()
+	return key, reason, true
+}
 
-	a.mu.Lock()
-	defer a.mu.Unlock()
+// setModelCooldownUntilLocked 写入冷却并返回写入结果；调用方必须持有 a.mu 写锁。
+func (a *Account) setModelCooldownUntilLocked(key, reason string, resetAt, now time.Time) ModelCooldown {
 	if a.ModelCooldowns == nil {
 		a.ModelCooldowns = make(map[string]ModelCooldown)
 	}
@@ -3130,6 +3139,38 @@ func (a *Account) SetModelCooldownUntil(model, reason string, resetAt time.Time)
 	}
 	a.ModelCooldowns[key] = cooldown
 	return cooldown
+}
+
+func (a *Account) SetModelCooldownUntil(model, reason string, resetAt time.Time) ModelCooldown {
+	key, reason, ok := normalizeModelCooldownArgs(model, reason, resetAt)
+	if !ok {
+		return ModelCooldown{}
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.setModelCooldownUntilLocked(key, reason, resetAt, time.Now())
+}
+
+// SetModelCooldownUntilAtLeast 与 SetModelCooldownUntil 相同，但保证不缩短仍然
+// 有效的既有冷却：该 model 现有 ResetAt 仍在生效且晚于传入 resetAt 时保留既有冷却，
+// 第二个返回值为 false 表示本次未写入。
+//
+// 「读现有 ResetAt → 比较 → 写入」在同一次 a.mu 写锁临界区内完成：否则两个并发
+// 写入都会读到同一个旧值，后落盘的短 deadline 会把先写入的长 deadline 覆盖掉。
+func (a *Account) SetModelCooldownUntilAtLeast(model, reason string, resetAt time.Time) (ModelCooldown, bool) {
+	key, reason, ok := normalizeModelCooldownArgs(model, reason, resetAt)
+	if !ok {
+		return ModelCooldown{}, false
+	}
+	now := time.Now()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if existing, exists := a.ModelCooldowns[key]; exists && existing.ResetAt.After(now) && existing.ResetAt.After(resetAt) {
+		return existing, false
+	}
+	return a.setModelCooldownUntilLocked(key, reason, resetAt, now), true
 }
 
 func (a *Account) RestoreModelCooldown(model, reason string, resetAt, updatedAt time.Time) {
@@ -4187,6 +4228,120 @@ func (s *Store) WithModelCooldownFilterContext(ctx context.Context, model string
 		}
 		blocked := s.accountHasCachedModelCooldownContext(ctx, acc, key)
 		return ctx.Err() == nil && !blocked
+	}
+}
+
+// WithAntigravityCooldownFilterContext 是 Antigravity 渠道的跨实例模型冷却过滤。
+//
+// Antigravity 的一个公开档位（gemini-3.8-flash-high）可能与另一个档位
+// （gemini-3.8-flash-low）共用同一个上游 wire 模型（gemini-3.8-flash-tiered），
+// 而 Gemini 配额又按整个 family 计量。多实例部署时，另一实例写入的 wireModel 或
+// family 冷却在本实例的内存里不可见，只按 publicModel 过滤就会把已被上游限流的
+// 账号再次选中。这里对候选账号依次检查 publicModel、wireModel 与 familyKey 三个
+// 键的共享缓存冷却，命中即过滤，并把读到的远端冷却同步进本地账号。
+//
+// familyKey 由调用方决定：非 Gemini 模型传空串即可。ctx 取消时按「拒绝候选」处理，
+// 与 WithModelCooldownFilterContext 保持同一 fail-closed 语义。
+func (s *Store) WithAntigravityCooldownFilterContext(ctx context.Context, publicModel, wireModel, familyKey string, filter AccountFilter) AccountFilter {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	keys := antigravityCooldownFilterKeys(publicModel, wireModel, familyKey)
+	return func(acc *Account) bool {
+		if acc == nil || ctx.Err() != nil {
+			return false
+		}
+		if filter != nil && !filter(acc) {
+			return false
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		if s == nil || len(keys) == 0 {
+			return true
+		}
+		for _, key := range keys {
+			if s.accountHasCachedModelCooldownContext(ctx, acc, key) {
+				return false
+			}
+			if ctx.Err() != nil {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// antigravityCooldownFilterKeys 把 publicModel / wireModel / familyKey 归一化成去重后
+// 的冷却键列表（保持该顺序），空键与重复键被丢弃。
+func antigravityCooldownFilterKeys(publicModel, wireModel, familyKey string) []string {
+	keys := make([]string, 0, 3)
+	seen := make(map[string]struct{}, 3)
+	for _, model := range []string{publicModel, wireModel, familyKey} {
+		key := normalizeModelCooldownKey(model)
+		if key == "" {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+// WithAntigravityAwareCooldownFilterContext 是「渠道未限定（auto Key）」请求的冷却过滤。
+//
+// 下游 Key 没有指定上游渠道时，候选池里既可能有 Antigravity 账号（native Gemini
+// generateContent/countTokens 被 antigravityOAuthChannelAccountFilter 硬限定为
+// Antigravity OAuth，Responses / Chat / Messages 也允许 Antigravity 账号），也可能有
+// 其它渠道的账号，而请求侧无法预先知道最终会落到哪一类。这里按候选账号自身的类型选择
+// 检查范围：
+//   - IsAntigravityAPI() 的候选：与 WithAntigravityCooldownFilterContext 完全一致的
+//     publicModel / wireModel / familyKey 三键检查（去重），闭合「另一实例写入的 wire
+//     或 family 冷却在本实例选号时看不见」的缺口；
+//   - 其它候选：与 WithModelCooldownFilterContext 完全一致的单一 publicModel 检查，
+//     行为不变。
+//
+// 下游 filter 对每个候选只调用一次（两个分支共用同一次求值）；ctx 取消时按「拒绝候选」
+// 处理，与上面两个过滤器保持同一 fail-closed 语义。
+func (s *Store) WithAntigravityAwareCooldownFilterContext(ctx context.Context, publicModel, wireModel, familyKey string, filter AccountFilter) AccountFilter {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	antigravityKeys := antigravityCooldownFilterKeys(publicModel, wireModel, familyKey)
+	publicKey := normalizeModelCooldownKey(publicModel)
+	return func(acc *Account) bool {
+		if acc == nil || ctx.Err() != nil {
+			return false
+		}
+		if filter != nil && !filter(acc) {
+			return false
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		if s == nil {
+			return true
+		}
+		keys := antigravityKeys
+		if !acc.IsAntigravityAPI() {
+			// 非 Antigravity 候选只看 publicModel，与既有单键语义完全一致。
+			if publicKey == "" {
+				return true
+			}
+			keys = []string{publicKey}
+		}
+		for _, key := range keys {
+			if s.accountHasCachedModelCooldownContext(ctx, acc, key) {
+				return false
+			}
+			if ctx.Err() != nil {
+				return false
+			}
+		}
+		return true
 	}
 }
 
@@ -7099,13 +7254,13 @@ func (s *Store) NextForSession(key string, apiKeyID int64, exclude map[int64]boo
 // 解除发生时绕过 binding 走完整挑号策略(NextExcludingWithFilter),后续 BindSessionAffinity
 // 会重新建立绑定。
 func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, DispatchPolicyStandard)
+	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, SelectionOptions{Policy: DispatchPolicyStandard})
 	return account, proxyURL
 }
 
 // NextForSessionWithDispatch 优先复用绑定账号，并按用量策略选号。
 func (s *Store) NextForSessionWithDispatch(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
-	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, policy)
+	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, SelectionOptions{Policy: policy})
 	return account, proxyURL
 }
 
@@ -7113,7 +7268,7 @@ func (s *Store) NextForSessionWithDispatch(key string, apiKeyID int64, exclude m
 // request paths. The returned guard must be passed to BindSessionAffinityWithGuard
 // after the attempt is selected or committed.
 func (s *Store) NextForSessionWithDispatchGuard(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
-	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, policy)
+	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, SelectionOptions{Policy: policy})
 }
 
 // NextForContinuationWithFilter preserves an existing account binding for a
@@ -7121,13 +7276,13 @@ func (s *Store) NextForSessionWithDispatchGuard(key string, apiKeyID int64, excl
 // to the account that created them, so bounded-affinity escape must not rotate
 // accounts.
 func (s *Store) NextForContinuationWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, true, DispatchPolicyStandard)
+	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, true, SelectionOptions{Policy: DispatchPolicyStandard})
 	return account, proxyURL
 }
 
 // NextForContinuationWithDispatch preserves a bound turn and applies a usage policy.
 func (s *Store) NextForContinuationWithDispatch(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
-	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, true, policy)
+	account, proxyURL, _ := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, true, SelectionOptions{Policy: policy})
 	return account, proxyURL
 }
 
@@ -7141,10 +7296,11 @@ func (s *Store) NextForContinuationWithDispatch(key string, apiKeyID int64, excl
 //
 // 绑定本身不存在时仍走完整挑号，与普通请求一致；TTL 过期只影响普通请求，
 // preserveBinding=true 的续链请求仍保留原账号。
-func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
+func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, opts SelectionOptions) (*Account, string, SessionAffinityGuard) {
 	if s == nil {
 		return nil, "", SessionAffinityGuard{}
 	}
+	policy := opts.Policy
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, policy), "", SessionAffinityGuard{}
@@ -7207,7 +7363,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				return nil, "", SessionAffinityGuard{}
 			}
 			if capacityFull {
-				fallback := s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy)
+				fallback := s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, opts)
 				if fallback == nil {
 					return nil, "", SessionAffinityGuard{}
 				}
@@ -7222,7 +7378,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				return s.takeByIDForContinuation(binding.accountID, apiKeyID, exclude, filter, key, policy), "", SessionAffinityGuard{}
 			}
 			s.UnbindSessionAffinity(key, binding.accountID)
-			return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy), "", SessionAffinityGuard{}
+			return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, opts), "", SessionAffinityGuard{}
 		}
 		// 跨进程缓存的 binding 也按 bounded 逻辑校验账号健康；Grok 账号套用 Grok 专属模式。
 		cacheMode := mode
@@ -7246,7 +7402,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				return nil, "", SessionAffinityGuard{}
 			}
 			if capacityFull {
-				fallback := s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy)
+				fallback := s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, opts)
 				if fallback == nil {
 					return nil, "", SessionAffinityGuard{}
 				}
@@ -7256,7 +7412,7 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 	}
 
-	return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, policy), "", SessionAffinityGuard{}
+	return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, opts), "", SessionAffinityGuard{}
 }
 
 // nextAccountForFreshAffinity 为"新亲和键首次绑定"选号(issue #484)。
@@ -7269,12 +7425,21 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 // 下一名,账号增删只迁移受影响的键。层间仍严格尊重运营者设置的调度优先级
 // 与健康档位,层内才忽略分数差异。
 func (s *Store) nextAccountForFreshAffinity(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
-	return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, DispatchPolicyStandard)
+	return s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, SelectionOptions{Policy: DispatchPolicyStandard})
 }
 
-func (s *Store) nextAccountForFreshAffinityWithDispatch(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) *Account {
+func (s *Store) nextAccountForFreshAffinityWithDispatch(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, opts SelectionOptions) *Account {
 	if s == nil {
 		return nil
+	}
+	policy := opts.Policy
+	// Antigravity 首绑 / Fresh 加权避险：handled=true 表示加权路径已接管本次选号（含号池
+	// 无可用容量返回 nil 的情况），此处必须直接返回，不能再走下面的 spread / HRW /
+	// round-robin 重扫——那会对同一批账号二次求值 filter，破坏「单次选号每个账号 filter
+	// 至多一次」的约束。handled=false（未开启 / 非 Antigravity / 非 round_robin）时才
+	// 平滑回退到既有散列逻辑。
+	if acc, handled := s.selectAntigravityBalancedAccount(key, apiKeyID, exclude, filter, opts); handled {
+		return acc
 	}
 	if !s.GetSessionAffinitySpread() || strings.TrimSpace(key) == "" {
 		return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, policy)
@@ -7844,44 +8009,45 @@ func (s *Store) hasContinuationCandidateWithDispatch(key string, apiKeyID int64,
 
 // WaitForSessionAvailableWithFilter waits for an account that satisfies the request-level filter.
 func (s *Store) WaitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	account, proxyURL, _, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, DispatchPolicyStandard)
+	account, proxyURL, _, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, SelectionOptions{Policy: DispatchPolicyStandard})
 	return account, proxyURL
 }
 
 func (s *Store) WaitForSessionAvailableWithDispatch(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
-	account, proxyURL, _, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, policy)
+	account, proxyURL, _, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, SelectionOptions{Policy: policy})
 	return account, proxyURL
 }
 
 // WaitForSessionAvailableWithDispatchGuard is the binding-aware waiting path.
 // It preserves the capacity-spillover decision made by the successful retry.
 func (s *Store) WaitForSessionAvailableWithDispatchGuard(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string, SessionAffinityGuard) {
-	account, proxyURL, guard, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, policy)
+	account, proxyURL, guard, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, false, SelectionOptions{Policy: policy})
 	return account, proxyURL, guard
 }
 
 // WaitForContinuationAvailableWithFilter waits for the account already bound
 // to a stateful continuation instead of falling through to another account.
 func (s *Store) WaitForContinuationAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
-	account, proxyURL, _, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, DispatchPolicyStandard)
+	account, proxyURL, _, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, SelectionOptions{Policy: DispatchPolicyStandard})
 	return account, proxyURL
 }
 
 func (s *Store) WaitForContinuationAvailableWithDispatch(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, policy DispatchPolicy) (*Account, string) {
-	account, proxyURL, _, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, policy)
+	account, proxyURL, _, _ := s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, true, SelectionOptions{Policy: policy})
 	return account, proxyURL
 }
 
 // WaitForDispatchAvailable exposes queue admission failures to protocol handlers.
 // preserveBinding retains the same account-only semantics as continuation waits.
 func (s *Store) WaitForDispatchAvailable(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, policy DispatchPolicy, heartbeat ...SchedulerWaitHeartbeat) (*Account, string, SessionAffinityGuard, error) {
-	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, preserveBinding, policy, heartbeat...)
+	return s.waitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, filter, preserveBinding, SelectionOptions{Policy: policy}, heartbeat...)
 }
 
-func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, policy DispatchPolicy, heartbeat ...SchedulerWaitHeartbeat) (*Account, string, SessionAffinityGuard, error) {
+func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool, opts SelectionOptions, heartbeat ...SchedulerWaitHeartbeat) (*Account, string, SessionAffinityGuard, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	policy := opts.Policy
 	if timeout <= 0 || ctx.Err() != nil {
 		return nil, "", SessionAffinityGuard{}, ctx.Err()
 	}
@@ -7978,11 +8144,7 @@ func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key strin
 		var acc *Account
 		var proxyURL string
 		var guard SessionAffinityGuard
-		if preserveBinding {
-			acc, proxyURL = s.NextForContinuationWithDispatch(key, apiKeyID, exclude, filter, policy)
-		} else {
-			acc, proxyURL, guard = s.NextForSessionWithDispatchGuard(key, apiKeyID, exclude, filter, policy)
-		}
+		acc, proxyURL, guard = s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, preserveBinding, opts)
 		if acc != nil {
 			if ctx.Err() != nil || !time.Now().Before(expires) {
 				s.Release(acc)
@@ -10265,6 +10427,33 @@ func (s *Store) MarkModelCooldownUntil(acc *Account, model, reason string, reset
 	if cooldown.Model == "" {
 		return cooldown
 	}
+	s.afterModelCooldownMarked(acc, cooldown)
+	return cooldown
+}
+
+// MarkModelCooldownUntilAtLeast 与 MarkModelCooldownUntil 相同，但不会缩短仍然
+// 有效的既有冷却：该 model 现有 ResetAt 晚于传入 resetAt 时保留既有冷却并直接返回，
+// 不写内存、不刷健康度、不落库。
+//
+// 用于多个公开档位共享同一上游 backing（wire 模型）或同一配额家族（Gemini family）
+// 的冷却键：这类键会被同账号上的多个事件写入，若按最后写入者胜出，一个 5s 的裸
+// RESOURCE_EXHAUSTED 就能把同账号刚写入的 290s 共享冷却改短，短 deadline 之后兄弟
+// 档位又能选中刚被限流的凭据。比较与写入在 Account 侧同一次写锁内完成。
+func (s *Store) MarkModelCooldownUntilAtLeast(acc *Account, model, reason string, resetAt time.Time) ModelCooldown {
+	if acc == nil || resetAt.IsZero() || !resetAt.After(time.Now()) {
+		return ModelCooldown{}
+	}
+	cooldown, wrote := acc.SetModelCooldownUntilAtLeast(model, reason, resetAt)
+	if cooldown.Model == "" || !wrote {
+		return cooldown
+	}
+	s.afterModelCooldownMarked(acc, cooldown)
+	return cooldown
+}
+
+// afterModelCooldownMarked 在冷却写入后统一刷新健康度、调度快照、跨实例冷却缓存
+// 与持久化。
+func (s *Store) afterModelCooldownMarked(acc *Account, cooldown ModelCooldown) {
 	acc.mu.Lock()
 	now := time.Now()
 	acc.LastRateLimitedAt = now
@@ -10284,7 +10473,6 @@ func (s *Store) MarkModelCooldownUntil(acc *Account, model, reason string, reset
 			log.Printf("[账号 %d] 持久化模型冷却失败 model=%s: %v", acc.DBID, cooldown.Model, err)
 		}
 	}
-	return cooldown
 }
 
 func (s *Store) ClearModelCooldown(acc *Account, model string) {

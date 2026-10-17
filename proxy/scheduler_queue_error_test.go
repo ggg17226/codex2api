@@ -46,7 +46,7 @@ func TestSchedulerQueueOverloadStopsContinuousRetry(t *testing.T) {
 	exclusions.MarkTransient(99)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, exclusions, nil, false, auth.DispatchPolicyStandard)
+	_, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, exclusions, nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 	if !errors.Is(err, auth.ErrSchedulerQueueFull) || ctx.Err() != nil {
 		t.Fatalf("overload was retried: %v (context %v)", err, ctx.Err())
 	}
@@ -242,7 +242,7 @@ func TestSchedulerWaitHeartbeatPreservesOneAdmission(t *testing.T) {
 	keepalive := &recordingContinuousRetryKeepalive{active: true}
 	ctx, cancel := context.WithTimeout(contextWithContinuousRetryKeepalive(keepalive), 35*time.Millisecond)
 	defer cancel()
-	_, _, _, _ = h.waitForRetryAccountAvailableWithGuard(ctx, "", 0, nil, nil, false, auth.DispatchPolicyStandard)
+	_, _, _, _ = h.waitForRetryAccountAvailableWithGuard(ctx, "", 0, nil, nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 	m := store.GetSchedulerMetrics()
 	if keepalive.writes < 2 || m.WaitStarted != 1 || m.Waiters != 0 || m.SelectionTotal != 1 {
 		t.Fatalf("heartbeats disturbed queue: writes=%d metrics=%+v", keepalive.writes, m)

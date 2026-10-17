@@ -100,6 +100,14 @@ Codex2API 采用三层配置架构：
 
 > `CODEX_UPSTREAM_TRANSPORT` 只控制 HTTP 入站请求转发到 Codex 上游时使用 `http` 还是 `ws`。客户端侧 WebSocket 入口独立可用：使用 `GET ws://<host>/v1/responses` 建连，首帧发送 `response.create` JSON，服务端会通过 Codex 上游 WS 返回 Responses 事件帧。
 
+### Antigravity 调度开关
+
+Antigravity 渠道的首绑 / Fresh 选号默认启用加权避险：候选账号按并发占用、已用配额与近期限流惩罚打分，刚被上游 429 的账号排到队尾，从而把新会话摊到健康账号上。
+
+| 变量 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `ANTIGRAVITY_BALANCED_AFFINITY` | 否 | `true` | 加权避险开关。取 `0` / `false` / `off` / `none` / `no`（大小写不敏感）时关闭，回退为原有 round-robin；其它值按开启处理。进程启动时读取一次，改动需重启生效。冷却正确性修复不受该开关影响、始终生效：public / wire 冷却写入（Gemini 配额耗尽时追加 family 键）、共享 wire / family 冷却不被更短事件缩短、跨实例冷却过滤（Antigravity 候选查三键） |
+
 ### 数据库配置
 
 #### PostgreSQL 模式
