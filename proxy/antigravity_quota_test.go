@@ -567,3 +567,174 @@ func TestApplyAntigravityCooldownUnstructured429KeepsLongerWireDeadline(t *testi
 		t.Fatal("a sibling tier on the same backing must stay blocked")
 	}
 }
+
+// antigravityArgonAccount 返回一个只发现到 gemini-4-argon-high 这块上游 backing 的账号：
+// gemini-4-argon-low/medium/high 三个公开档位都骑在它上面，其中 high 的公开名与 wire 名
+// 完全相同，public 冷却键本身就是共享 wire 冷却键。
+func antigravityArgonAccount(id int64) *auth.Account {
+	return &auth.Account{
+		DBID:                 id,
+		UpstreamType:         auth.UpstreamAntigravity,
+		AccessToken:          "google-token",
+		AntigravityProjectID: "google-project",
+		Models:               []string{"gemini-4-argon-high"},
+	}
+}
+
+// TestAntigravitySharedWireCooldownKeyClassification 覆盖共享冷却键判定本身：公开名与
+// 解析出的 wire 同名、或目录里另有档位将 model 当作 backing 时成立；公开档位解析到自己
+// 独占且与公开名不同的 backing（或干脆解析不出 wire）时不成立——否则会把普通覆盖语义
+// 无差别改成单调写，短事件再也无法缩短任何模型冷却。
+func TestAntigravitySharedWireCooldownKeyClassification(t *testing.T) {
+	cases := []struct {
+		model     string
+		wireModel string
+		want      bool
+	}{
+		// Argon：公开名即共享 backing 名。
+		{"gemini-4-argon-high", "gemini-4-argon-high", true},
+		{"gemini-4-argon-high", "", true},
+		// 兄弟档位的公开名不是任何档位的 backing。
+		{"gemini-4-argon-low", "gemini-4-argon-high", false},
+		// 原始 backing id 被三个公开档位共享。
+		{"gemini-3.8-flash-tiered", "", true},
+		{"gemini-3.7-flash-tiered", "", true},
+		// 逻辑档位的 backing 同时是固定档位的公开名。
+		{"gemini-3.6-flash-low", "", true},
+		// 解析出的 wire 与公开名同名：按规则一律按共享键写入，保证单调性。
+		{"claude-sonnet-4-6", "claude-sonnet-4-6", true},
+		// 解析不到 wire、目录里也没有别的档位以它为 backing：保持覆盖语义。
+		{"claude-sonnet-4-6", "", false},
+		{"some-discovered-raw-model", "", false},
+		// 公开档位解析到自己独占且与公开名不同的 backing：保持覆盖语义。
+		{"gemini-3.8-flash-low", "gemini-3.8-flash-tiered", false},
+		{"gemini-3.1-pro-high", "gemini-pro-agent", false},
+		{"", "", false},
+	}
+	for _, tc := range cases {
+		if got := antigravitySharedWireCooldownKey(tc.model, tc.wireModel); got != tc.want {
+			t.Fatalf("antigravitySharedWireCooldownKey(%q, %q) = %v, want %v", tc.model, tc.wireModel, got, tc.want)
+		}
+	}
+}
+
+// TestApplyAntigravityCooldownSharedNamePublicModelNotShortened 覆盖 P1-1：
+// gemini-4-argon-high 的公开名与共享 wire 键同名，先由 low 的 290s 限流把共享冷却写到
+// ~290s，随后 high 自己的 5s 裸 RESOURCE_EXHAUSTED 走的是无条件覆盖的 public 写入路径，
+// 必须同样受 AtLeast 单调性保护，不能把兄弟档位的长冷却改短。
+func TestApplyAntigravityCooldownSharedNamePublicModelNotShortened(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	account := antigravityArgonAccount(7471)
+
+	if wire, ok := antigravityResolvePublicModelForAccount(account, "gemini-4-argon-high"); !ok || wire != "gemini-4-argon-high" {
+		t.Fatalf("gemini-4-argon-high resolved to %q, ok=%v, want the shared backing itself", wire, ok)
+	}
+
+	first := applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityLongRateLimitBody), nil, "gemini-4-argon-low")
+	if first.Cooldown < 280*time.Second {
+		t.Fatalf("sibling cooldown = %s, want the 290s retry hint", first.Cooldown)
+	}
+	if remaining := account.ModelCooldownRemaining("gemini-4-argon-high"); remaining < 280*time.Second {
+		t.Fatalf("shared key cooldown = %s after the sibling event, want ~290s", remaining)
+	}
+
+	short := applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityUnclassifiedRateLimitBody), nil, "gemini-4-argon-high")
+	if remaining := account.ModelCooldownRemaining("gemini-4-argon-high"); remaining < 60*time.Second {
+		t.Fatalf("shared key cooldown = %s after the same-name brief event, want the longer deadline kept", remaining)
+	}
+	// 决策本身也要报告生效的长 deadline，否则上层会按 5s 之后重新调度该账号。
+	if short.ResetAt.IsZero() || time.Until(short.ResetAt) < 60*time.Second {
+		t.Fatalf("decision = %+v, want the kept longer deadline", short)
+	}
+	if !antigravityAccountModelRateLimited(account, "gemini-4-argon-medium", "gemini-4-argon-high") {
+		t.Fatal("a sibling tier on the same backing must stay blocked")
+	}
+}
+
+// TestApplyAntigravityCooldownSharedNamePublicModelExtendsWithLongerEvent 是反向用例：
+// high 先吃到 5s 短冷却，随后兄弟档位的 290s 限流必须能把同名共享键延长。
+func TestApplyAntigravityCooldownSharedNamePublicModelExtendsWithLongerEvent(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	account := antigravityArgonAccount(7472)
+
+	first := applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityUnclassifiedRateLimitBody), nil, "gemini-4-argon-high")
+	if first.Cooldown > 10*time.Second {
+		t.Fatalf("first cooldown = %s, want the brief back-off", first.Cooldown)
+	}
+	if remaining := account.ModelCooldownRemaining("gemini-4-argon-high"); remaining > 10*time.Second {
+		t.Fatalf("shared key cooldown = %s after the brief event, want ~5s", remaining)
+	}
+
+	extended := applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityLongRateLimitBody), nil, "gemini-4-argon-medium")
+	if extended.Cooldown < 280*time.Second {
+		t.Fatalf("extended decision = %+v, want the 290s retry hint", extended)
+	}
+	if remaining := account.ModelCooldownRemaining("gemini-4-argon-high"); remaining < 280*time.Second {
+		t.Fatalf("shared key cooldown = %s, want the longer deadline to extend it", remaining)
+	}
+}
+
+// TestApplyAntigravityCooldownSharedNamePublicModelOnUnstructured429 覆盖非结构化 429
+// 的同一约束：通用 429 策略按覆盖语义写 public 冷却，而 public 名就是共享 wire 键时这次
+// 覆盖会把兄弟档位的长冷却改短，必须写回。
+func TestApplyAntigravityCooldownSharedNamePublicModelOnUnstructured429(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	store.SetModelCooldownSettings(database.ModelCooldownSettings{
+		RelayMode:    database.ModelCooldownModeFixed,
+		RelaySeconds: 60,
+		OAuthMode:    database.ModelCooldownModeFixed,
+		OAuthSeconds: 60,
+	})
+	account := antigravityArgonAccount(7473)
+
+	applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityLongRateLimitBody), nil, "gemini-4-argon-low")
+	if remaining := account.ModelCooldownRemaining("gemini-4-argon-high"); remaining < 280*time.Second {
+		t.Fatalf("shared key cooldown = %s after the sibling event, want ~290s", remaining)
+	}
+
+	if _, ok := parseAntigravityQuotaError(http.StatusTooManyRequests, []byte(`{"error":{"message":"slow down"}}`)); ok {
+		t.Fatal("the body must stay unparseable so the generic 429 path is exercised")
+	}
+	decision := applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(`{"error":{"message":"slow down"}}`), &http.Response{Header: http.Header{}}, "gemini-4-argon-high")
+	if decision.Scope != rateLimitScopeModel || decision.Model != "gemini-4-argon-high" {
+		t.Fatalf("decision = %+v, want a model-scoped cooldown", decision)
+	}
+	if remaining := account.ModelCooldownRemaining("gemini-4-argon-high"); remaining < 120*time.Second {
+		t.Fatalf("shared key cooldown = %s after an unstructured 429, want the longer deadline kept", remaining)
+	}
+	if !antigravityAccountModelRateLimited(account, "gemini-4-argon-medium", "gemini-4-argon-high") {
+		t.Fatal("a sibling tier on the same backing must stay blocked")
+	}
+}
+
+// TestApplyAntigravityCooldownUnsharedPublicModelKeepsOverwriteSemantics 是回归护栏：
+// 公开档位解析到自己独占、且与公开名不同的 backing 时，短事件仍按既有语义覆盖同名
+// public 冷却，单调性保护只作用于共享键（wire / family / 与 wire 同名的公开名）。
+func TestApplyAntigravityCooldownUnsharedPublicModelKeepsOverwriteSemantics(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	account := newAntigravityCooldownTestAccount(7474)
+
+	if wire, ok := antigravityResolvePublicModelForAccount(account, "gemini-3.8-flash-low"); !ok || wire != "gemini-3.8-flash-tiered" {
+		t.Fatalf("gemini-3.8-flash-low resolved to %q, ok=%v, want the shared backing", wire, ok)
+	}
+
+	applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityLongRateLimitBody), nil, "gemini-3.8-flash-low")
+	if remaining := account.ModelCooldownRemaining("gemini-3.8-flash-low"); remaining < 280*time.Second {
+		t.Fatalf("public cooldown = %s, want the 290s retry hint", remaining)
+	}
+	short := applyAntigravityCooldown(store, account, http.StatusTooManyRequests, []byte(antigravityUnclassifiedRateLimitBody), nil, "gemini-3.8-flash-low")
+	if short.Cooldown > 10*time.Second {
+		t.Fatalf("decision = %+v, want the brief back-off", short)
+	}
+	if remaining := account.ModelCooldownRemaining("gemini-3.8-flash-low"); remaining <= 0 || remaining > 10*time.Second {
+		t.Fatalf("public cooldown = %s, want the brief event to keep overwriting a non-shared public key", remaining)
+	}
+	// 同一次短事件仍不得改短共享 wire 键上的长冷却。
+	if remaining := account.ModelCooldownRemaining("gemini-3.8-flash-tiered"); remaining < 280*time.Second {
+		t.Fatalf("wire cooldown = %s, want the longer deadline kept on the shared key", remaining)
+	}
+}

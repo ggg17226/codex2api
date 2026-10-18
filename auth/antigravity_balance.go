@@ -54,14 +54,36 @@ func (s *Store) antigravityBalancedSelectionEnabled(opts SelectionOptions) bool 
 	return s.GetSchedulerMode() == schedulerModeRoundRobin
 }
 
-// antigravityTieBreak 是加权选号同分时的确定性打散键：对 (亲和键, 账号ID) 做 FNV-1a。
+// fmix64 是 MurmurHash3 finalizer（也见于 SplitMix64）的 64 位雪崩混淆：三次
+// 「右移 33 位亦或 + 大素数乘法」把输入每一位的差异扩散到全部 64 位输出。
+//
+// 纯算术实现，不依赖平台、字节序与编译器内联，任何 GOARCH 上恒得同一结果。
+func fmix64(h uint64) uint64 {
+	h ^= h >> 33
+	h *= 0xff51afd7ed558ccd
+	h ^= h >> 33
+	h *= 0xc4ceb9fe1a85ec53
+	h ^= h >> 33
+	return h
+}
+
+// antigravityTieBreak 是加权选号同分时的确定性打散键：对 (亲和键, 账号ID) 做
+// FNV-1a，再用 fmix64 做终值雪崩混淆。
+//
 // 同一亲和键在号池不变时恒得同一顺序（幂等），不同键把并列账号摊开。
+//
+// 终值混淆不是可选项：FNV-1a 只有「乘 1099511628211 后亦或」一步扩散，输入尾部
+// 字节只影响输出的高位区间，低位比特几乎不混合。而这里的输入尾部是十进制 ASCII
+// 的账号 ID——同批账号的 ID 是连续整数，后缀高度相似（"…1"、"…2"、"…10"、"…11"），
+// 直接取 FNV-1a 最小值会把并列账号系统性地偏向某几个 ID 前缀/后缀，同分打散退化成
+// 固定偏好。fmix64 之后每个输出比特都依赖全部输入比特，最小值选择才真正与账号身份
+// 无关。
 func antigravityTieBreak(key string, dbID int64) uint64 {
 	hasher := fnv.New64a()
 	_, _ = hasher.Write([]byte(key))
 	_, _ = hasher.Write([]byte{':'})
 	_, _ = hasher.Write([]byte(strconv.FormatInt(dbID, 10)))
-	return hasher.Sum64()
+	return fmix64(hasher.Sum64())
 }
 
 // selectAntigravityBalancedAccount 是首绑 / Fresh 选号的 Antigravity 加权避险实现。

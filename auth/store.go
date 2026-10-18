@@ -3224,6 +3224,26 @@ func (a *Account) ModelCooldownRemaining(model string) time.Duration {
 	return remaining
 }
 
+// ModelCooldownFor 返回账号上某个 model 当前仍在生效的冷却条目（含 ResetAt 与
+// Reason）；不存在或已过期时第二个返回值为 false。
+//
+// 与 ModelCooldownRemaining 相比，它把 ResetAt 一起交出，调用方无需自己用
+// 「now + remaining」反推 deadline，因此可以在改写共享冷却键前拿到既有的精确
+// deadline（例如判断本次较短的冷却是否会把更长的共享冷却改短）。
+func (a *Account) ModelCooldownFor(model string) (ModelCooldown, bool) {
+	key := normalizeModelCooldownKey(model)
+	if key == "" {
+		return ModelCooldown{}, false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	cooldown, ok := a.ModelCooldowns[key]
+	if !ok || !cooldown.ResetAt.After(time.Now()) {
+		return ModelCooldown{}, false
+	}
+	return cooldown, true
+}
+
 func (a *Account) ActiveModelCooldowns() []ModelCooldown {
 	a.mu.RLock()
 	defer a.mu.RUnlock()

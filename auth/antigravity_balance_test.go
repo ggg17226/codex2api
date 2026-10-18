@@ -2,6 +2,9 @@ package auth
 
 import (
 	"fmt"
+	"hash/fnv"
+	"math/bits"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -365,5 +368,187 @@ func TestAntigravityFreshAffinityLegacyPathForNonAntigravity(t *testing.T) {
 	}
 	if len(seen) < 2 {
 		t.Fatalf("legacy path stopped spreading across accounts: %v", seen)
+	}
+}
+
+// antigravityTieBreakRaw 是修复前的打散键：FNV-1a 终值不做雪崩混淆。测试用它证明
+// 下面的分布断言确实能抓到「去掉 fmix64」这一回归。
+func antigravityTieBreakRaw(key string, dbID int64) uint64 {
+	hasher := fnv.New64a()
+	_, _ = hasher.Write([]byte(key))
+	_, _ = hasher.Write([]byte{':'})
+	_, _ = hasher.Write([]byte(strconv.FormatInt(dbID, 10)))
+	return hasher.Sum64()
+}
+
+// antigravityTieBreakWinner 统计「同分时取哈希最小值」在 accounts 个连续 DBID 账号上的
+// 实际胜率分布：这才是 tie-break 真正被使用的方式，也是十进制 ASCII 偏斜唯一会显形的地方。
+func antigravityTieBreakWinner(tie func(string, int64) uint64, accounts, trials int) []int {
+	wins := make([]int, accounts)
+	for i := 1; i <= trials; i++ {
+		key := fmt.Sprintf("user-session-%d", i)
+		best, bestHash := 0, tie(key, 1)
+		for account := int64(2); account <= int64(accounts); account++ {
+			if got := tie(key, account); got < bestHash {
+				best, bestHash = int(account-1), got
+			}
+		}
+		wins[best]++
+	}
+	return wins
+}
+
+func antigravityChiSquared(wins []int) float64 {
+	total, expected := 0, 0.0
+	for _, win := range wins {
+		total += win
+	}
+	expected = float64(total) / float64(len(wins))
+	chi := 0.0
+	for _, win := range wins {
+		diff := float64(win) - expected
+		chi += diff * diff / expected
+	}
+	return chi
+}
+
+// TestAntigravityTieBreakGoldenVectors 钉住跨平台确定性：纯算术 fmix64 在任何 GOARCH
+// 上都必须给出同一批常量，否则同分顺序会随构建产物漂移。
+func TestAntigravityTieBreakGoldenVectors(t *testing.T) {
+	cases := []struct {
+		key  string
+		dbID int64
+		want uint64
+	}{
+		{"", 0, 0x43751afc069a4a45},
+		{"user-session-1", 1, 0xf155dbb4071460da},
+		{"gemini-key", 42, 0xcf28f3d8add60b65},
+		{"中文亲和键", 1000003, 0x8dcf2c161bc0b644},
+	}
+	for _, tc := range cases {
+		if got := antigravityTieBreak(tc.key, tc.dbID); got != tc.want {
+			t.Fatalf("antigravityTieBreak(%q, %d) = 0x%016x, want 0x%016x", tc.key, tc.dbID, got, tc.want)
+		}
+	}
+	if got := fmix64(0); got != 0 {
+		t.Fatalf("fmix64(0) = 0x%016x, want 0", got)
+	}
+	if got := fmix64(1); got != 0xb456bcfc34c2cb2c {
+		t.Fatalf("fmix64(1) = 0x%016x, want 0xb456bcfc34c2cb2c", got)
+	}
+	if got := fmix64(0xffffffffffffffff); got != 0x64b5720b4b825f21 {
+		t.Fatalf("fmix64(^0) = 0x%016x, want 0x64b5720b4b825f21", got)
+	}
+}
+
+// TestAntigravityTieBreakDeterministicAndSensitive 覆盖打散键的基本性质：同输入恒等、
+// 键或账号变化时输出变化、大批量样本内无碰撞。
+func TestAntigravityTieBreakDeterministicAndSensitive(t *testing.T) {
+	if antigravityTieBreak("stable-key", 7) != antigravityTieBreak("stable-key", 7) {
+		t.Fatal("antigravityTieBreak is not deterministic")
+	}
+	seen := make(map[uint64]string, 20000)
+	for i := 1; i <= 10000; i++ {
+		key := fmt.Sprintf("affinity-%d", i)
+		for _, dbID := range []int64{int64(i), int64(i) + 1000000} {
+			hash := antigravityTieBreak(key, dbID)
+			sample := fmt.Sprintf("%s/%d", key, dbID)
+			if previous, ok := seen[hash]; ok {
+				t.Fatalf("hash collision between %s and %s", previous, sample)
+			}
+			seen[hash] = sample
+		}
+	}
+	// 相邻账号 ID（十进制 ASCII 只差最后一位）必须给出完全不同的哈希。
+	similar := map[uint64]int{}
+	for dbID := int64(1); dbID <= 1000; dbID++ {
+		similar[antigravityTieBreak("same-key", dbID)]++
+	}
+	if len(similar) != 1000 {
+		t.Fatalf("1000 consecutive account IDs produced %d distinct hashes", len(similar))
+	}
+}
+
+// TestAntigravityTieBreakAvalanche 覆盖雪崩性：输入单比特翻转后，输出平均应有约一半
+// 比特翻转。FNV-1a 单独使用时该值明显低于 32（尾部字节只影响高位区间），终值混淆把它
+// 拉回理论值。
+func TestAntigravityTieBreakAvalanche(t *testing.T) {
+	total, samples := 0.0, 0
+	for dbID := int64(0); dbID < 2000; dbID++ {
+		base := antigravityTieBreak("avalanche-key", dbID)
+		for bit := uint64(0); bit < 64; bit++ {
+			flipped := antigravityTieBreak("avalanche-key", int64(uint64(dbID)^(1<<bit)))
+			total += float64(bits.OnesCount64(base ^ flipped))
+			samples++
+		}
+	}
+	mean := total / float64(samples)
+	if mean < 31 || mean > 33 {
+		t.Fatalf("mean avalanche distance = %.2f bits, want ~32 of 64", mean)
+	}
+	// 对照：未混淆的 FNV-1a 明显偏离，说明本断言对终值混淆敏感。
+	rawTotal, rawSamples := 0.0, 0
+	for dbID := int64(0); dbID < 2000; dbID++ {
+		base := antigravityTieBreakRaw("avalanche-key", dbID)
+		for bit := uint64(0); bit < 64; bit++ {
+			flipped := antigravityTieBreakRaw("avalanche-key", int64(uint64(dbID)^(1<<bit)))
+			rawTotal += float64(bits.OnesCount64(base ^ flipped))
+			rawSamples++
+		}
+	}
+	if rawMean := rawTotal / float64(rawSamples); rawMean >= mean-0.5 {
+		t.Fatalf("raw FNV-1a avalanche mean = %.2f, fmix64 mean = %.2f: the finalizer stopped contributing", rawMean, mean)
+	}
+}
+
+// TestAntigravityTieBreakSpreadAcrossAccountIDs 是 P2-1 的核心断言：同分账号按哈希最小值
+// 打散时，每个账号的胜率必须接近 1/N。十进制 ASCII 后缀在纯 FNV-1a 下会把最小值系统性
+// 地推向某个账号（实测 8 个账号里有一个吃到 50% 的样本），fmix64 之后应回到均匀分布。
+func TestAntigravityTieBreakSpreadAcrossAccountIDs(t *testing.T) {
+	const accounts, trials = 8, 20000
+
+	wins := antigravityTieBreakWinner(antigravityTieBreak, accounts, trials)
+	expected := float64(trials) / float64(accounts)
+	for index, win := range wins {
+		share := float64(win) / expected
+		if share < 0.6 || share > 1.4 {
+			t.Fatalf("account %d won %.1f%% of ties, expected %.0f of %d, wins=%v", index+1, share*100, expected, trials, wins)
+		}
+	}
+	if chi := antigravityChiSquared(wins); chi > 60 {
+		t.Fatalf("tie-break winner chi-squared = %.1f (df=%d), wins=%v, want a uniform spread", chi, accounts-1, wins)
+	}
+
+	// 对照：去掉终值混淆后同一批输入必须显著偏斜，否则本测试抓不到回归。
+	rawWins := antigravityTieBreakWinner(antigravityTieBreakRaw, accounts, trials)
+	rawMax := 0
+	for _, win := range rawWins {
+		if win > rawMax {
+			rawMax = win
+		}
+	}
+	if float64(rawMax) <= expected*1.5 {
+		t.Fatalf("raw FNV-1a winner distribution is unexpectedly flat (max %d of %d): this test no longer proves the need for fmix64", rawMax, trials)
+	}
+
+	// 大 ID / 稀疏 ID 同样要摊开：真实部署里账号 ID 是数据库自增主键，可能已经很大。
+	for _, ids := range [][]int64{{1000003, 1000004, 1000005, 1000006}, {1, 7, 999999, 1000000, 4294967296}} {
+		counts := make([]int, len(ids))
+		for i := 1; i <= trials; i++ {
+			key := fmt.Sprintf("spread-%d", i)
+			best, bestHash := 0, antigravityTieBreak(key, ids[0])
+			for index := 1; index < len(ids); index++ {
+				if got := antigravityTieBreak(key, ids[index]); got < bestHash {
+					best, bestHash = index, got
+				}
+			}
+			counts[best]++
+		}
+		exp := float64(trials) / float64(len(ids))
+		for index, count := range counts {
+			if share := float64(count) / exp; share < 0.55 || share > 1.45 {
+				t.Fatalf("ids %v: account %d won %.1f%% of ties, counts=%v", ids, index, share*100, counts)
+			}
+		}
 	}
 }
