@@ -86,15 +86,27 @@ func TestAntigravityQuota_AcceptanceMatrix(t *testing.T) {
 
 	t.Run("s7_reset_expiry_drops_only_that_bucket", func(t *testing.T) {
 		zero := 0.0
-		// #7：weekly 零（reset 远期）+ 5h 零（reset 到期）——5h 转 unknown 后
-		// weekly 零桶继续阻断（Spec §3.3 账户级阻断与桶隔离）。
+		// #7：5h 零（reset 近期，已到期）+ weekly 零（reset 远期，未到期）——5h 转
+		// unknown 后 weekly 零桶继续阻断（Spec §3.3 账户级阻断与桶隔离）。
+		//
+		// 【桶顺序是本用例断言的一部分，不可随意调整】
+		// antigravityQuotaSnapshotGateBlock 按 Buckets 切片顺序遍历，命中未到期零桶
+		// 即立即 return，因此「已到期」的 5h 桶必须排在 [0] 位：遍历器先走到
+		// resetAt 已过 -> continue 分支（窗口滚动转 unknown，仅解除本桶），再命中
+		// [1] 位 weekly 的 known_zero 阻断。
+		// 反若把 weekly 提到 [0]，遍历在首位就 return，5h 的 continue 分支根本不
+		// 参与求值，本用例退化为只验证「未到期零桶仍阻断」；此时生产代码哪怕把到期
+		// 桶误写成 return false（任一桶到期即放行整账号），s7 依然假通过，Spec §3.3
+		// 「到期只解除当前桶、其他有效零桶仍需阻断」的后半段语义就失去实质断言。
 		snap := AntigravityQuotaSnapshot{
 			SchemaVersion:  2,
 			SourceMetadata: verifiedMeta(now),
 			Groups: []AntigravityQuotaGroup{{
 				Buckets: []AntigravityQuotaBucket{
-					{Window: "weekly", RemainingFraction: &zero, FractionPresent: true, ResetTime: now.Add(72 * time.Hour).Format(time.RFC3339), ObservedAt: now, ObservationSeq: 3, TTLSeconds: 7200},
+					// [0] 必须先到期：驱动 gate 的 continue 分支。
 					{Window: "5h", RemainingFraction: &zero, FractionPresent: true, ResetTime: now.Add(10 * time.Minute).Format(time.RFC3339), ObservedAt: now, ObservationSeq: 3, TTLSeconds: 7200},
+					// [1] 必须未到期：在 [0] 被 continue 后才命中阻断。
+					{Window: "weekly", RemainingFraction: &zero, FractionPresent: true, ResetTime: now.Add(72 * time.Hour).Format(time.RFC3339), ObservedAt: now, ObservationSeq: 3, TTLSeconds: 7200},
 				},
 			}},
 		}
