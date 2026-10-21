@@ -196,6 +196,9 @@ type Account struct {
 	antigravityQuotaObservedAt  time.Time
 	antigravityQuotaValid       bool
 	antigravityModelMaxOutput   map[string]int
+	// AntigravityQuota 是 credentials JSON 中 antigravity_quota 的内存 V2 投影，
+	// 受 a.mu 保护；由账号装载、client.Sync 落库后与 outbox consumer 投影共同更新。
+	AntigravityQuota AntigravityQuotaSnapshot
 	// antigravityPenalty 是 Antigravity 首绑/Fresh 选号避险使用的近期限流惩罚：
 	// 进程内、指数衰减、不落库（见 antigravity_ratelimit.go）。它只影响「下一个
 	// 新会话优先选谁」，不参与冷却判定，也不改变任何既有绑定语义。

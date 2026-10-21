@@ -1030,19 +1030,27 @@ func normalizeAntigravityQuota(payload antigravityQuotaResponse, now time.Time) 
 		if model.QuotaInfo == nil || !isTrackedAntigravityModel(modelID) {
 			continue
 		}
-		fraction := 0.0
+		var fraction *float64
+		fractionPresent := false
 		if model.QuotaInfo.RemainingFraction != nil {
-			fraction = *model.QuotaInfo.RemainingFraction
+			value := *model.QuotaInfo.RemainingFraction
+			if value < 0 {
+				value = 0
+			}
+			if value > 1 {
+				value = 1
+			}
+			fraction = &value
+			fractionPresent = true
 		}
-		if fraction < 0 {
-			fraction = 0
-		}
-		if fraction > 1 {
-			fraction = 1
+		percent := 0
+		if fractionPresent {
+			percent = int(*fraction * 100)
 		}
 		result.Models = append(result.Models, AntigravityModelQuota{
-			ModelID: modelID, DisplayName: model.DisplayName, RemainingFraction: fraction,
-			RemainingPercent: int(fraction * 100), ResetTime: model.QuotaInfo.ResetTime,
+			ModelID: modelID, DisplayName: model.DisplayName,
+			RemainingFraction: fraction, FractionPresent: fractionPresent,
+			RemainingPercent: percent, ResetTime: model.QuotaInfo.ResetTime,
 			SupportsImages: model.SupportsImages, SupportsThinking: model.SupportsThinking,
 			ThinkingBudget: model.ThinkingBudget, Recommended: model.Recommended,
 			MaxTokens: model.MaxTokens, MaxOutputTokens: model.MaxOutputTokens,
@@ -1096,12 +1104,16 @@ func (c *AntigravityClient) fetchQuotaSummary(ctx context.Context, accessToken, 
 		for _, group := range response.Groups {
 			item := AntigravityQuotaGroup{DisplayName: group.DisplayName, Description: group.Description, Buckets: []AntigravityQuotaBucket{}}
 			for _, bucket := range group.Buckets {
-				fraction := 0.0
+				var fraction *float64
+				fractionPresent := false
 				if bucket.RemainingFraction != nil {
-					fraction = *bucket.RemainingFraction
+					value := *bucket.RemainingFraction
+					fraction = &value
+					fractionPresent = true
 				}
 				item.Buckets = append(item.Buckets, AntigravityQuotaBucket{
-					BucketID: bucket.BucketID, Window: bucket.Window, RemainingFraction: fraction,
+					BucketID: bucket.BucketID, Window: bucket.Window,
+					RemainingFraction: fraction, FractionPresent: fractionPresent,
 					ResetTime: bucket.ResetTime, DisplayName: bucket.DisplayName, Description: bucket.Description,
 				})
 			}

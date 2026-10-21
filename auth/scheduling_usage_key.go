@@ -85,7 +85,10 @@ func antigravitySchedulingUsedPercent(q AntigravityQuotaSnapshot) (float64, bool
 	found := false
 	for _, group := range q.Groups {
 		for _, bucket := range group.Buckets {
-			remaining := clampRemainingFraction(bucket.RemainingFraction)
+			if !bucket.FractionPresent || bucket.RemainingFraction == nil {
+				continue
+			}
+			remaining := clampRemainingFraction(*bucket.RemainingFraction)
 			if remaining < minRemaining {
 				minRemaining = remaining
 			}
@@ -99,10 +102,18 @@ func antigravitySchedulingUsedPercent(q AntigravityQuotaSnapshot) (float64, bool
 		return 0, false
 	}
 	sum := 0.0
+	count := 0
 	for _, model := range q.Models {
-		sum += clampRemainingFraction(model.RemainingFraction)
+		if !model.FractionPresent || model.RemainingFraction == nil {
+			continue
+		}
+		sum += clampRemainingFraction(*model.RemainingFraction)
+		count++
 	}
-	return clampSchedulingPercent((1 - sum/float64(len(q.Models))) * 100), true
+	if count == 0 {
+		return 0, false
+	}
+	return clampSchedulingPercent((1 - sum/float64(count)) * 100), true
 }
 
 // AntigravityQuotaUsedPercent 把持久化的 antigravity_quota 凭据折算成已用百分比，
@@ -126,6 +137,7 @@ func (a *Account) applyAntigravityQuotaSchedulingLocked(raw string) {
 	a.antigravityQuotaUsedPercent = 0
 	a.antigravityQuotaObservedAt = time.Time{}
 	a.antigravityModelMaxOutput = nil
+	a.AntigravityQuota = AntigravityQuotaSnapshot{}
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return
@@ -134,6 +146,7 @@ func (a *Account) applyAntigravityQuotaSchedulingLocked(raw string) {
 	if err := json.Unmarshal([]byte(raw), &snapshot); err != nil {
 		return
 	}
+	a.AntigravityQuota = snapshot
 	for _, model := range snapshot.Models {
 		id := strings.ToLower(strings.TrimSpace(model.ModelID))
 		if id == "" || model.MaxOutputTokens == nil || *model.MaxOutputTokens <= 0 {
