@@ -157,23 +157,32 @@ func (a *Account) IsAntigravityQuotaExhaustedLocked(now time.Time) (bool, string
 	if a == nil || a.UpstreamType != UpstreamAntigravity {
 		return false, "", time.Time{}
 	}
+	return antigravityQuotaSnapshotGateBlock(&a.AntigravityQuota, now)
+}
+
+// antigravityQuotaSnapshotGateBlock 是硬门禁谓词的唯一实现体：只依赖一份 V2 配额快照
+// 与当前时钟，不读 Account 的其他字段。调度门禁与展示侧（管理端 /state）都经由它求值，
+// 避免出现第二套判定口径（Spec §3.3）。
+func antigravityQuotaSnapshotGateBlock(snapshot *AntigravityQuotaSnapshot, now time.Time) (bool, string, time.Time) {
 	// 止血开关：若系统设置关闭门禁，立即放行（Spec §8.1，不影响已落库快照）
-	settings := ConfiguredAntigravitySettings()
-	if !settings.GetQuotaGateEnabled() {
+	if !ConfiguredAntigravitySettings().GetQuotaGateEnabled() {
+		return false, "", time.Time{}
+	}
+	if snapshot == nil {
 		return false, "", time.Time{}
 	}
 	// legacy 快照（无 schema_version=2）：旧数据显式 0 不可信，绝不硬封（Spec §3.1）
-	if a.AntigravityQuota.SchemaVersion != 2 {
+	if snapshot.SchemaVersion != 2 {
 		return false, "", time.Time{}
 	}
 	// 元数据可信条件（Spec §3.1）：applied_seq > 0、observed_at 非零且不在未来；
 	// 缺失即 unknown，不构成阻断依据。
-	meta, ok := a.AntigravityQuota.SourceMetadata["groups"]
+	meta, ok := snapshot.SourceMetadata["groups"]
 	if !ok || meta.AppliedSeq <= 0 || meta.ObservedAt.IsZero() || meta.ObservedAt.After(now) {
 		return false, "", time.Time{}
 	}
 
-	for _, g := range a.AntigravityQuota.Groups {
+	for _, g := range snapshot.Groups {
 		for _, b := range g.Buckets {
 			w, ok := NormalizeAntigravityWindow(b.Window)
 			if !ok || !b.FractionPresent || b.RemainingFraction == nil {
@@ -203,4 +212,35 @@ func (a *Account) IsAntigravityQuotaExhaustedLocked(now time.Time) (bool, string
 		}
 	}
 	return false, "", time.Time{}
+}
+
+// AntigravityQuotaGateView 是硬门禁的只读视图，供管理端展示四态与来源元数据
+// （Spec §3.3「管理端按来源显示事实过期」、§9 管理层落点）。它不参与任何调度决策，
+// 判定与调度侧共用 antigravityQuotaSnapshotGateBlock 同一函数。
+type AntigravityQuotaGateView struct {
+	GateEnabled    bool
+	SchemaVersion  int
+	Blocked        bool
+	Reason         string
+	Stale          bool
+	ResetAt        time.Time
+	SourceMetadata map[string]SourceMeta
+}
+
+// EvaluateAntigravityQuotaGate 对一份持久化配额快照做与硬门禁完全同口径的只读求值。
+// 调用方无需持有 Account 锁，因此管理端可以直接对数据库行里的快照观测门禁状态。
+func EvaluateAntigravityQuotaGate(snapshot *AntigravityQuotaSnapshot, now time.Time) AntigravityQuotaGateView {
+	view := AntigravityQuotaGateView{GateEnabled: ConfiguredAntigravitySettings().GetQuotaGateEnabled()}
+	if snapshot != nil {
+		view.SchemaVersion = snapshot.SchemaVersion
+		if len(snapshot.SourceMetadata) > 0 {
+			view.SourceMetadata = make(map[string]SourceMeta, len(snapshot.SourceMetadata))
+			for key, meta := range snapshot.SourceMetadata {
+				view.SourceMetadata[key] = meta
+			}
+		}
+	}
+	view.Blocked, view.Reason, view.ResetAt = antigravityQuotaSnapshotGateBlock(snapshot, now)
+	view.Stale = view.Blocked && view.Reason == "stale_zero"
+	return view
 }
