@@ -1,8 +1,147 @@
 package auth
 
 import (
+	"sync/atomic"
 	"time"
 )
+
+const (
+	// quotaGateRetryAfterDefault 是没有可信 resetAt 时对外暴露的默认重试间隔
+	// （Spec §6.2 #2）：短到不至于把客户端长时间误导，又不至于让重试风暴打满。
+	quotaGateRetryAfterDefault = 60 * time.Second
+	// quotaGateRetryAfterMax 是 Retry-After 的上限（Spec §6.2 #2）：可信 resetAt 常常
+	// 落在数小时之后，但把 429 的 Retry-After 写成小时级会让下游网关直接放弃。
+	quotaGateRetryAfterMax = 3600 * time.Second
+)
+
+// QuotaExhaustedError 携带对外 429 契约所需的重试与原因信息。
+// Bound=true 表示续链 preserveBinding=true 场景（reason=quota_gate_bound）。
+type QuotaExhaustedError struct {
+	Bound      bool
+	RetryAfter time.Duration
+}
+
+func (e *QuotaExhaustedError) Error() string {
+	if e.Bound {
+		return "antigravity bound account quota exhausted"
+	}
+	return "antigravity account quota exhausted"
+}
+
+// Is 使 errors.Is(err, ErrQuotaExhausted) 对两种原因都成立。
+func (e *QuotaExhaustedError) Is(target error) bool { return target == ErrQuotaExhausted }
+
+// quotaGateRetryAfter 把阻断到期时刻折算成对外的 Retry-After：无可信到期时刻取默认
+// 60s，超出上限则钳制到 3600s（Spec §6.2 #2）。
+func quotaGateRetryAfter(resetAt time.Time, now time.Time) time.Duration {
+	if resetAt.IsZero() || !resetAt.After(now) {
+		return quotaGateRetryAfterDefault
+	}
+	remaining := resetAt.Sub(now)
+	if remaining > quotaGateRetryAfterMax {
+		return quotaGateRetryAfterMax
+	}
+	return remaining
+}
+
+// antigravityAccountQuotaGateBlock 是自锁封装的「是否被硬门禁阻断 + 阻断到期时刻」，
+// 供锁外的候选集合求值使用；与选号复用的是同一个谓词，不存在第二套判定口径。
+func antigravityAccountQuotaGateBlock(acc *Account) (bool, time.Time) {
+	if acc == nil {
+		return false, time.Time{}
+	}
+	acc.mu.RLock()
+	defer acc.mu.RUnlock()
+	exhausted, _, resetAt := acc.IsAntigravityQuotaExhaustedLocked(time.Now())
+	if !exhausted {
+		return false, time.Time{}
+	}
+	return true, resetAt
+}
+
+// antigravityQuotaGateCandidateScope 判定账号是否仍在候选集合内：管理面停用（禁用 /
+// 调度暂停 / 智能暂停）的账号本就不是候选，既不构成配额阻断，也不构成混合原因。
+func antigravityQuotaGateCandidateScope(acc *Account) bool {
+	if acc == nil {
+		return false
+	}
+	if atomic.LoadInt32(&acc.Disabled) != 0 {
+		return false
+	}
+	if atomic.LoadInt32(&acc.DispatchPaused) != 0 || atomic.LoadInt32(&acc.IntelligencePaused) != 0 {
+		return false
+	}
+	return true
+}
+
+// AntigravityQuotaGateExhaustion 判定「候选集合是否全部因配额硬门禁被阻断」：命中时
+// 返回类型化的 *QuotaExhaustedError（Bound 表示续链 preserveBinding 场景，RetryAfter
+// 取被阻断候选中最早的可信到期时刻），否则返回 nil。
+//
+// 严格的保守口径（Spec §6.2 #2）：
+//   - 只要还有一个候选未被门禁阻断（可选、并发满、鉴权失败、冷却、非 Antigravity…），
+//     都属于「混合原因」，返回 nil，调用方保持既有 503 / 无可用账号语义；
+//   - 续链（preserveBinding=true）的候选集合就是绑定的那个账号，绑定关系不因阻断改变；
+//   - 只做一次只读求值，调用方不得再据此二次推断 reason。
+func (s *Store) AntigravityQuotaGateExhaustion(sessionKey string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter, preserveBinding bool) *QuotaExhaustedError {
+	if s == nil {
+		return nil
+	}
+	now := time.Now()
+	filter = s.withUsableEgressFilter(filter)
+
+	var candidates []*Account
+	if preserveBinding {
+		accountID, ok := s.SessionAffinityAccountID(sessionKey)
+		if !ok || accountID == 0 || (exclude != nil && exclude[accountID]) {
+			return nil
+		}
+		s.mu.RLock()
+		acc := s.lookupByIDLocked(accountID)
+		s.mu.RUnlock()
+		if acc == nil || !s.accountAllowedForAPIKey(acc, apiKeyID) {
+			return nil
+		}
+		if filter != nil && !filter(acc) {
+			return nil
+		}
+		candidates = []*Account{acc}
+	} else {
+		for _, acc := range s.accountSnapshotAccounts() {
+			if acc == nil || (exclude != nil && exclude[acc.DBID]) {
+				continue
+			}
+			if !antigravityQuotaGateCandidateScope(acc) {
+				continue
+			}
+			if !s.accountAllowedForAPIKey(acc, apiKeyID) {
+				continue
+			}
+			if filter != nil && !filter(acc) {
+				continue
+			}
+			candidates = append(candidates, acc)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	var earliestReset time.Time
+	for _, acc := range candidates {
+		blocked, resetAt := antigravityAccountQuotaGateBlock(acc)
+		if !blocked {
+			return nil // 混合原因：不是「全部因配额阻断」
+		}
+		if resetAt.IsZero() {
+			continue
+		}
+		if earliestReset.IsZero() || resetAt.Before(earliestReset) {
+			earliestReset = resetAt
+		}
+	}
+	return &QuotaExhaustedError{Bound: preserveBinding, RetryAfter: quotaGateRetryAfter(earliestReset, now)}
+}
 
 // IsAntigravityQuotaExhaustedLocked 是纯内存只读的硬门禁谓词：基于已投影到
 // Account.AntigravityQuota 的 V2 快照，判断该账号此刻是否应因配额耗尽被阻断调度。
