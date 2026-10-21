@@ -7,15 +7,26 @@ import (
 
 // ComputeBackoff 计算连续失败退避时长：min(I * 2^k, max(4I, 60min))。
 // consecutiveFailures <= 0 时视为无失败，直接返回 interval。
+// 采用整数翻倍循环而非 math.Pow：后者在 k 较大时（如 I=60min、k>=22）float64
+// 乘积转 time.Duration 会 int64 溢出为负数，绕过封顶判断后调用方 now.Add(backoff)
+// 得到过去时间，触发即时重试风暴。
 func ComputeBackoff(interval time.Duration, consecutiveFailures int) time.Duration {
-	if consecutiveFailures <= 0 {
-		return interval
-	}
-	mult := math.Pow(2, float64(consecutiveFailures))
-	backoff := time.Duration(float64(interval) * mult)
 	capVal := 4 * interval
 	if capVal < 60*time.Minute {
 		capVal = 60 * time.Minute
+	}
+	if consecutiveFailures <= 0 {
+		return interval
+	}
+	if interval <= 0 {
+		return capVal
+	}
+	backoff := interval
+	for i := 0; i < consecutiveFailures; i++ {
+		if backoff >= capVal || backoff > math.MaxInt64/2 {
+			return capVal
+		}
+		backoff *= 2
 	}
 	if backoff > capVal {
 		return capVal

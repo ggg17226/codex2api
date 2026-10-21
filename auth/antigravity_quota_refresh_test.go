@@ -26,6 +26,25 @@ func TestComputeBackoff(t *testing.T) {
 	if b5 := ComputeBackoff(i3, 5); b5 != 60*time.Minute {
 		t.Fatalf("expected k=5 capped backoff 60m, got %v", b5)
 	}
+
+	// 大 k 溢出防护：float64(2^k) 转 time.Duration 会 int64 溢出为负数，
+	// 必须始终被封顶在 max(4I, 60min)，且绝不返回负值。
+	if b := ComputeBackoff(i60, 22); b != 4*time.Hour {
+		t.Fatalf("ComputeBackoff(60m, 22) = %v, want 4h", b)
+	}
+	if b := ComputeBackoff(i3, 26); b != 60*time.Minute {
+		t.Fatalf("ComputeBackoff(3m, 26) = %v, want 60m", b)
+	}
+	if b := ComputeBackoff(i60, 1024); b != 4*time.Hour {
+		t.Fatalf("ComputeBackoff(60m, 1024) = %v, want 4h", b)
+	}
+	if b := ComputeBackoff(-1, 5); b < 0 {
+		t.Fatalf("ComputeBackoff(-1, 5) = %v, want non-negative", b)
+	}
+	// 非法 interval 且无失败记录时不放大退避（返回原始 interval 语义由调用方兜底）
+	if b := ComputeBackoff(-1, 0); b > 0 {
+		t.Fatalf("ComputeBackoff(-1, 0) = %v, want <= 0 (no failure)", b)
+	}
 }
 
 func TestCheckCoverageWindow(t *testing.T) {
