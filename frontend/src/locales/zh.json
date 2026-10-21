@@ -7247,5 +7247,23 @@
       "6": "周六",
       "7": "周日"
     }
+  },
+  "antigravityQuota": {
+    "cardTitle": "配额自动刷新与门禁",
+    "cardDescription": "周期性拉取 Antigravity 账号的上游配额事实，用于调度选择与硬门禁判定。",
+    "refreshEnabled": "自动刷新配额",
+    "refreshEnabledHint": "按固定间隔向上游查询各账号配额事实。",
+    "gateEnabled": "配额硬门禁",
+    "gateEnabledHint": "开启后配额耗尽的账号将被直接拦截并返回 429，不再进入排队。",
+    "refreshInterval": "刷新间隔（分钟）",
+    "refreshIntervalHint": "允许范围 3–60 分钟；保存后本机立即重排，跨副本经 outbox ≤5 秒生效。",
+    "hint": "关闭仅停止自动配额查询，模型目录维护仍独立",
+    "saved": "配额设置已保存",
+    "clearAction": "清除配额事实",
+    "clearTitle": "清除配额事实",
+    "clearConfirm": "确认要清除选中账号的配额事实吗？该操作将删除已存储的配额事实并递增配额纪元，用于误封止血；不影响凭据与模型目录。",
+    "clearDone": "已清除 {{cleared}} 个账号的配额事实",
+    "clearPartial": "已清除 {{cleared}} 个账号的配额事实，{{failed}} 个失败",
+    "clearFailed": "清除配额事实失败：{{error}}"
   }
 }

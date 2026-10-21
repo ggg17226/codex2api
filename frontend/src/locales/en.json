@@ -7250,5 +7250,23 @@
       "6": "Saturday",
       "7": "Sunday"
     }
+  },
+  "antigravityQuota": {
+    "cardTitle": "Quota auto refresh & hard gate",
+    "cardDescription": "Periodically pulls upstream quota facts for Antigravity accounts to drive scheduling and the hard gate.",
+    "refreshEnabled": "Auto refresh quota",
+    "refreshEnabledHint": "Queries upstream quota facts for each account at a fixed interval.",
+    "gateEnabled": "Quota hard gate",
+    "gateEnabledHint": "When enabled, quota-exhausted accounts are rejected directly with 429 instead of waiting in queue.",
+    "refreshInterval": "Refresh interval (minutes)",
+    "refreshIntervalHint": "Allowed range 3–60 minutes; reschedules locally on save and propagates to other replicas within ≤5s via outbox.",
+    "hint": "Turning this off only stops automatic quota queries; model catalog maintenance stays independent",
+    "saved": "Quota settings saved",
+    "clearAction": "Clear quota facts",
+    "clearTitle": "Clear quota facts",
+    "clearConfirm": "Clear the quota facts of the selected accounts? This deletes stored quota facts and bumps the quota epoch as a kill switch for false bans; credentials and model catalogs are untouched.",
+    "clearDone": "Cleared quota facts for {{cleared}} account(s)",
+    "clearPartial": "Cleared quota facts for {{cleared}} account(s), {{failed}} failed",
+    "clearFailed": "Failed to clear quota facts: {{error}}"
   }
 }

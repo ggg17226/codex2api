@@ -29,6 +29,7 @@ import type {
   AntigravityAccountState,
   AntigravityStateSyncResponse,
   AntigravityCapabilityProbeResponse,
+  AntigravityQuotaClearResponse,
   BatchUpdateGrokModelsRequest,
   BatchUpdateGrokModelsResponse,
   FetchGrokModelsResponse,
@@ -1052,10 +1053,22 @@ export const api = {
       body: JSON.stringify({ channels }),
     }),
   getAntigravitySettings: () => request<AntigravitySettingsResponse>('/settings/antigravity'),
-  updateAntigravitySettings: (patch: { model_redirects?: Record<string, string>; redirect_overrides_effort?: boolean; expose_thoughts?: boolean }) =>
+  updateAntigravitySettings: (patch: {
+    model_redirects?: Record<string, string>
+    redirect_overrides_effort?: boolean
+    expose_thoughts?: boolean
+    quota_refresh_enabled?: boolean
+    quota_refresh_interval_minutes?: number
+    quota_gate_enabled?: boolean
+  }) =>
     request<AntigravitySettingsResponse>('/settings/antigravity', {
       method: 'PUT',
       body: JSON.stringify(patch),
+    }),
+  clearAntigravityQuota: (ids: number[]) =>
+    request<AntigravityQuotaClearResponse>('/accounts/antigravity/quota/clear', {
+      method: 'POST',
+      body: JSON.stringify({ account_ids: ids }),
     }),
   getChannelTestSettings: () => request<ChannelTestSettingsResponse>('/settings/channel-tests'),
   updateChannelTestSettings: (patch: Partial<Record<'antigravity' | 'claude', Partial<ChannelTestSettings>>>) =>
