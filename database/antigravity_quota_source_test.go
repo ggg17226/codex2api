@@ -12,7 +12,16 @@ import (
 
 // newAntigravityQuotaTestDB 按方言创建测试库（Postgres 需隔离 DSN，未配置则跳过，
 // 模式与 database/auto_reset_exhausted_test.go 一致），并插入一个 AG 账号。
+// credential_family_id 列回填为 "fam1"，与 credentials 内的 family 保持一致（真实
+// 写入路径中两者由 UpdateAccountCredentialsCAS 同事务同步）。
 func newAntigravityQuotaTestDB(t *testing.T, ctx context.Context, creds string) (*DB, int64) {
+	t.Helper()
+	return newAntigravityQuotaTestDBWithFamily(t, ctx, creds, "fam1")
+}
+
+// newAntigravityQuotaTestDBWithFamily 同 newAntigravityQuotaTestDB，但可指定
+// credential_family_id 列（传空串保持列为 NULL，用于验证严格 scope fence）。
+func newAntigravityQuotaTestDBWithFamily(t *testing.T, ctx context.Context, creds, familyID string) (*DB, int64) {
 	t.Helper()
 	driver := "sqlite"
 	dsn := filepath.Join(t.TempDir(), "quota.db")
@@ -37,7 +46,27 @@ func newAntigravityQuotaTestDB(t *testing.T, ctx context.Context, creds string) 
 			t.Fatalf("resolve account id failed: %v (lastInsertId: %v)", scanErr, lastIDErr)
 		}
 	}
+	if trimmed := strings.TrimSpace(familyID); trimmed != "" {
+		if _, famErr := db.conn.ExecContext(ctx, `UPDATE accounts SET credential_family_id = ? WHERE id = ?`, trimmed, id); famErr != nil {
+			t.Fatalf("backfill credential_family_id failed: %v", famErr)
+		}
+	}
 	return db, id
+}
+
+// loadAntigravityCredentialsDoc 直接读取持久化 credentials 文本并解码，用于断言落库
+// **形态**（字符串 vs 对象）而不是内存工作形态。
+func loadAntigravityCredentialsDoc(t *testing.T, ctx context.Context, db *DB, accountID int64) map[string]any {
+	t.Helper()
+	var raw string
+	if err := db.conn.QueryRowContext(ctx, `SELECT credentials FROM accounts WHERE id = ?`, accountID).Scan(&raw); err != nil {
+		t.Fatalf("reload credentials failed: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatalf("decode persisted credentials failed: %v (%s)", err, raw)
+	}
+	return doc
 }
 
 func TestAntigravityQuotaSource_LatestSuccessWinsAndEpochBarrier(t *testing.T) {
@@ -221,6 +250,16 @@ func TestAntigravityQuotaSource_RTConflictThreeBranches(t *testing.T) {
 	if strings.Contains(rawC, `"rotated-at"`) || !strings.Contains(rawC, "antigravity_permanent_refresh_error") {
 		t.Fatalf("branch (c) must isolate identity without writing rotated RT: %s", rawC)
 	}
+	// 分支 (c) 除日志外还须留下可查询的账号事件审计。
+	var auditEvents int
+	if err := dbC.conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM account_events WHERE account_id = ? AND event_type = ?`,
+		accC, antigravityRTConflictAuditEventType).Scan(&auditEvents); err != nil {
+		t.Fatalf("query rt-conflict audit events failed: %v", err)
+	}
+	if auditEvents == 0 {
+		t.Fatalf("branch (c) must persist an account_events audit record (type=%s)", antigravityRTConflictAuditEventType)
+	}
 }
 
 // TestAntigravityQuotaSource_CommitMergesOnlyReturnedBuckets 锁定 Spec §4.1 #2 的合并
@@ -310,5 +349,187 @@ func TestAntigravityQuotaSource_CommitMergesOnlyReturnedBuckets(t *testing.T) {
 	models := merged.SourceMetadata["models"]
 	if models.AppliedSeq != 3 || !models.ObservedAt.Equal(time.Date(2026, 10, 20, 9, 0, 0, 0, time.UTC)) {
 		t.Fatalf("other sources must stay untouched, got %+v", models)
+	}
+}
+
+// TestAntigravityQuotaSource_ReserveOnlyPersistsQuotaAsString 是 B1 的专项回归：
+// 预约路径（只递增 current_attempt_seq、不提交）同样必须把 antigravity_quota 以
+// **JSON 字符串**形态落库；并且随后 ClearAntigravityQuotaSourcesCAS 必须彻底清空
+// facts 并推进失效纪元，不得因类型断言失败而残留事实。
+func TestAntigravityQuotaSource_ReserveOnlyPersistsQuotaAsString(t *testing.T) {
+	ctx := context.Background()
+	db, accID := newAntigravityQuotaTestDB(t, ctx,
+		`{"access_token":"at","credential_family_id":"fam1","upstream_type":"antigravity","antigravity_quota_epoch":7}`)
+
+	seq, epoch, err := db.ReserveAntigravityQuotaSource(ctx, accID, "groups", 1, "fam1")
+	if err != nil || seq != 1 || epoch != 7 {
+		t.Fatalf("reserve = (seq=%d, epoch=%d, err=%v), want (1, 7, nil)", seq, epoch, err)
+	}
+
+	doc := loadAntigravityCredentialsDoc(t, ctx, db, accID)
+	quotaRaw, isString := doc[antigravityQuotaCredentialKey].(string)
+	if !isString {
+		t.Fatalf("antigravity_quota must persist as a JSON string, got %T: %v",
+			doc[antigravityQuotaCredentialKey], doc[antigravityQuotaCredentialKey])
+	}
+	if strings.TrimSpace(quotaRaw) == "" {
+		t.Fatal("reservation must persist the reserved attempt sequence")
+	}
+	// 读取端硬门禁：只有字符串形态下 GetCredential 才拿得到文本（map 会 fail-open）。
+	if got := strings.TrimSpace((&AccountRow{ID: accID, Credentials: doc}).GetCredential(antigravityQuotaCredentialKey)); got == "" {
+		t.Fatal("AccountRow.GetCredential must not fail-open on durable quota facts")
+	}
+	var facts map[string]any
+	if err := json.Unmarshal([]byte(quotaRaw), &facts); err != nil {
+		t.Fatalf("persisted quota is not valid JSON: %v (%s)", err, quotaRaw)
+	}
+	entry, _ := facts[antigravityQuotaKeySourceMetadata].(map[string]any)["groups"].(map[string]any)
+	if entry == nil {
+		t.Fatalf("reservation must write source_metadata.groups, got %s", quotaRaw)
+	}
+	if attempts, _ := int64FromJSONValue(entry[antigravitySourceMetaCurrentAttemptSeq]); attempts != 1 {
+		t.Fatalf("current_attempt_seq = %v, want 1", entry[antigravitySourceMetaCurrentAttemptSeq])
+	}
+	if _, committed := entry[antigravitySourceMetaAppliedSeq]; committed {
+		t.Fatalf("reservation alone must not fake applied_seq: %v", entry)
+	}
+
+	// 只预约未提交后，清除必须彻底清空 facts 并推进失效纪元。
+	newEpoch, err := db.ClearAntigravityQuotaSourcesCAS(ctx, accID)
+	if err != nil || newEpoch != 8 {
+		t.Fatalf("clear = (epoch=%d, err=%v), want (8, nil)", newEpoch, err)
+	}
+	after := loadAntigravityCredentialsDoc(t, ctx, db, accID)
+	quotaAfter, isString := after[antigravityQuotaCredentialKey].(string)
+	if !isString {
+		t.Fatalf("cleared antigravity_quota must stay a JSON string, got %T", after[antigravityQuotaCredentialKey])
+	}
+	if strings.TrimSpace(quotaAfter) != "" ||
+		strings.Contains(quotaAfter, antigravityQuotaKeySourceMetadata) ||
+		strings.Contains(quotaAfter, antigravitySourceMetaCurrentAttemptSeq) {
+		t.Fatalf("clear must wipe reserved facts, got %q", quotaAfter)
+	}
+	// 旧 epoch 的在途提交必须被失效屏障拒绝。
+	applied, err := db.CommitAntigravityQuotaSource(ctx, accID, "groups", seq+1, epoch, 1, "fam1", `{"schema_version":2}`)
+	if err != nil || applied {
+		t.Fatalf("in-flight commit after clear = (applied=%v, err=%v), want blocked", applied, err)
+	}
+}
+
+// TestAntigravityQuotaSource_ClearWipesFactsStoredAsJSONObject 覆盖清除路径的防御性
+// 兼容：既有数据若曾被写成嵌套 JSON 对象（历史脏数据），清除仍必须彻底清空 facts 并
+// 推进 epoch，绝不允许因 `.(string)` 断言失败而静默跳过。
+func TestAntigravityQuotaSource_ClearWipesFactsStoredAsJSONObject(t *testing.T) {
+	ctx := context.Background()
+	dirty := `{"access_token":"at","credential_family_id":"fam1","upstream_type":"antigravity","antigravity_quota_epoch":4,` +
+		`"antigravity_quota":{"schema_version":2,"source_metadata":{"groups":{"current_attempt_seq":3,"applied_seq":2}},` +
+		`"quota_groups":[{"display_name":"Weekly","buckets":[{"window":"weekly","remaining_fraction":0,"fraction_present":true}]}]}}`
+	db, accID := newAntigravityQuotaTestDBWithFamily(t, ctx, dirty, "fam1")
+
+	before := loadAntigravityCredentialsDoc(t, ctx, db, accID)
+	if _, isObject := before[antigravityQuotaCredentialKey].(map[string]any); !isObject {
+		t.Fatalf("fixture must stay a JSON object to reproduce the legacy shape, got %T", before[antigravityQuotaCredentialKey])
+	}
+	// 该形态正是 B1 的危害现场：读取端 GetCredential 会 fail-open。
+	if got := (&AccountRow{ID: accID, Credentials: before}).GetCredential(antigravityQuotaCredentialKey); got != "" {
+		t.Fatalf("object-shaped quota is expected to fail-open on GetCredential, got %q", got)
+	}
+
+	newEpoch, err := db.ClearAntigravityQuotaSourcesCAS(ctx, accID)
+	if err != nil || newEpoch != 5 {
+		t.Fatalf("clear = (epoch=%d, err=%v), want (5, nil)", newEpoch, err)
+	}
+	after := loadAntigravityCredentialsDoc(t, ctx, db, accID)
+	quotaAfter, isString := after[antigravityQuotaCredentialKey].(string)
+	if !isString || strings.TrimSpace(quotaAfter) != "" {
+		t.Fatalf("clear must wipe object-shaped facts into an empty string, got %T: %v",
+			after[antigravityQuotaCredentialKey], after[antigravityQuotaCredentialKey])
+	}
+	if encoded, _ := json.Marshal(after); strings.Contains(string(encoded), antigravityQuotaKeyQuotaGroups) ||
+		strings.Contains(string(encoded), antigravityQuotaKeySourceMetadata) {
+		t.Fatalf("facts residue after clear: %s", encoded)
+	}
+}
+
+// TestAntigravityQuotaSource_RTConflictReplayLostRaceTrustsWinner 是 M1 的回归：
+// 分支 (b) 的重放若被同身份 winner 抢先（generation 已推进 / token 已变），必须归为
+// trust_winner，不得误报身份谱系断裂并落下永久隔离标记。
+func TestAntigravityQuotaSource_RTConflictReplayLostRaceTrustsWinner(t *testing.T) {
+	ctx := context.Background()
+	pre := `{"access_token":"pre-at","refresh_token":"pre-rt","credential_family_id":"fam1","upstream_type":"antigravity","antigravity_quota_epoch":1}`
+	db, accID := newAntigravityQuotaTestDB(t, ctx, pre)
+	t.Cleanup(func() { antigravityRTReplayRaceHook = nil })
+	// 在重放窗口内模拟另一路同身份刷新抢先落库（generation 1 → 2、token 变更）。
+	antigravityRTReplayRaceHook = func(accountID int64) {
+		if _, applied, err := db.UpdateAccountCredentialsCAS(ctx, accountID, 1, map[string]any{
+			"access_token": "winner-at", "refresh_token": "winner-rt",
+		}); err != nil || !applied {
+			t.Fatalf("simulated winner write failed: applied=%v err=%v", applied, err)
+		}
+	}
+
+	outcome, err := db.HandleAntigravityRTConflict(ctx, accID, 1, pre, map[string]any{
+		"access_token": "loser-at", "refresh_token": "loser-rt",
+	})
+	if err != nil || outcome != RTConflictTrustWinner {
+		t.Fatalf("replay that lost the race = (%v, %v), want trust_winner", outcome, err)
+	}
+	doc := loadAntigravityCredentialsDoc(t, ctx, db, accID)
+	if got, _ := doc["access_token"].(string); got != "winner-at" {
+		t.Fatalf("trust_winner must keep the durable winner token, got %v", doc["access_token"])
+	}
+	if marker, ok := doc[antigravityQuotaPermanentRefreshErrorKey].(string); ok && strings.TrimSpace(marker) != "" {
+		t.Fatalf("a lost race must not isolate the identity, marker=%q", marker)
+	}
+	var auditEvents int
+	if err := db.conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM account_events WHERE account_id = ? AND event_type = ?`,
+		accID, antigravityRTConflictAuditEventType).Scan(&auditEvents); err != nil {
+		t.Fatalf("query audit events failed: %v", err)
+	}
+	if auditEvents != 0 {
+		t.Fatalf("trust_winner must not write an isolation audit event, got %d", auditEvents)
+	}
+}
+
+// TestAntigravityQuotaSource_StrictIdentityScopeFence 是 M2 的回归：expectedScope 非空时
+// durable family 必须完全相等才放行——不一致要拒、family 列尚未回填（空）同样要拒；
+// 只有空 expectedScope 才表示不校验身份。
+func TestAntigravityQuotaSource_StrictIdentityScopeFence(t *testing.T) {
+	ctx := context.Background()
+	db, accID := newAntigravityQuotaTestDB(t, ctx,
+		`{"access_token":"at","credential_family_id":"fam1","upstream_type":"antigravity","antigravity_quota_epoch":1}`)
+
+	if _, _, err := db.ReserveAntigravityQuotaSource(ctx, accID, "groups", 1, "fam2"); err == nil {
+		t.Fatal("reserve with a mismatched scope must be rejected")
+	}
+	seq, epoch, err := db.ReserveAntigravityQuotaSource(ctx, accID, "groups", 1, "fam1")
+	if err != nil {
+		t.Fatalf("reserve with a matching scope failed: %v", err)
+	}
+	if applied, commitErr := db.CommitAntigravityQuotaSource(ctx, accID, "groups", seq, epoch, 1, "fam2", `{"schema_version":2}`); commitErr != nil || applied {
+		t.Fatalf("commit with a mismatched scope = (applied=%v, err=%v), want silent rejection", applied, commitErr)
+	}
+	if applied, commitErr := db.CommitAntigravityQuotaSource(ctx, accID, "groups", seq, epoch, 1, "fam1", `{"schema_version":2}`); commitErr != nil || !applied {
+		t.Fatalf("commit with a matching scope = (applied=%v, err=%v), want applied", applied, commitErr)
+	}
+	if _, _, err := db.ReserveAntigravityQuotaSource(ctx, accID, "models", 1, ""); err != nil {
+		t.Fatalf("an empty expected scope must stay unchecked: %v", err)
+	}
+
+	// family 列尚未回填（durable 身份为空）同样严格拒绝，且拒绝路径不得留下事实。
+	dbNoFam, accNoFam := newAntigravityQuotaTestDBWithFamily(t, ctx,
+		`{"access_token":"at","credential_family_id":"fam1","upstream_type":"antigravity","antigravity_quota_epoch":1}`, "")
+	if _, _, err := dbNoFam.ReserveAntigravityQuotaSource(ctx, accNoFam, "groups", 1, "fam1"); err == nil {
+		t.Fatal("reserve against an account without a durable family must be rejected")
+	}
+	if applied, commitErr := dbNoFam.CommitAntigravityQuotaSource(ctx, accNoFam, "groups", 1, 1, 1, "fam1", `{"schema_version":2}`); commitErr != nil || applied {
+		t.Fatalf("commit against an account without a durable family = (applied=%v, err=%v), want rejection", applied, commitErr)
+	}
+	doc := loadAntigravityCredentialsDoc(t, ctx, dbNoFam, accNoFam)
+	if value, present := doc[antigravityQuotaCredentialKey]; present {
+		if text, isString := value.(string); !isString || strings.TrimSpace(text) != "" {
+			t.Fatalf("rejected writes must not persist facts, got %v", value)
+		}
 	}
 }

@@ -4,6 +4,10 @@ package database
 //
 // 本文件与 auth 包解耦：配额事实以 credentials JSON 的 `antigravity_quota`
 // （字符串形式的 JSON 快照）与 `antigravity_quota_epoch`（失效纪元）两个键持久化，
+// 其中 `antigravity_quota` 的**落库形态恒为 JSON 字符串**：mutator 在内存里把它当成
+// map 就地合并只是工作形态，写库前一律由 normalizeAntigravityQuotaCredentialForWrite
+// 序列化回字符串——全仓库读取端都经 `AccountRow.GetCredential` 取文本，写成嵌套
+// JSON Object 会让内存硬门禁 fail-open、清除逻辑静默跳过 facts 清空。
 // 所有写入都在**短事务 + 行锁**内完成，事务中不联网：
 //   - 预约：逐 source 递增 `source_metadata.<source>.current_attempt_seq`；
 //   - 提交：Latest-Success-Wins，仅要求 `mySeq > applied_seq` 且 gen/scope/epoch 匹配；
@@ -47,6 +51,11 @@ const (
 
 	// antigravityQuotaTimerKindPrefix 是配额流定时器在 maintenance_jobs 中的 job_kind 前缀。
 	antigravityQuotaTimerKindPrefix = "antigravity_quota"
+
+	// antigravityRTConflictAuditEventType / antigravityRTConflictAuditSource 是 RT 冲突
+	// 分支 (c)（身份隔离）写入 account_events 的审计事件类型与来源。
+	antigravityRTConflictAuditEventType = "antigravity_rt_conflict_isolated"
+	antigravityRTConflictAuditSource    = "system"
 )
 
 // RTConflictOutcome 是 RT 轮换冲突按 reload 结果分流后的处置分支（Spec §4.1 #5）。
@@ -76,6 +85,10 @@ func (o RTConflictOutcome) String() string {
 		return "unknown"
 	}
 }
+
+// antigravityRTReplayRaceHook 仅供本包测试注入：HandleAntigravityRTConflict 分支 (b)
+// 重放前调用一次，用于确定性地模拟"重放窗口内被同身份 winner 抢先写入"。生产恒为 nil。
+var antigravityRTReplayRaceHook func(accountID int64)
 
 // antigravityQuotaRowTx 是短事务内锁定的账号行。
 type antigravityQuotaRowTx struct {
@@ -117,6 +130,13 @@ func (db *DB) mutateAntigravityQuotaCredentials(ctx context.Context, accountID i
 		if mutateErr != nil || !proceed {
 			return mutateErr
 		}
+		// 落库形态栅栏：antigravity_quota 在持久化文档中**恒为 JSON 字符串**（既有规范）。
+		// mutator 为了方便就地合并会把它变成 map（内存工作形态），必须在 marshal 之前统一
+		// 序列化回字符串，否则落库会变成嵌套 JSON Object：`AccountRow.GetCredential` 对
+		// map 返回 ""，内存硬门禁会 fail-open，清除逻辑也会静默跳过 facts 清空。
+		if normalizeErr := normalizeAntigravityQuotaCredentialForWrite(row.doc); normalizeErr != nil {
+			return normalizeErr
+		}
 		encoded, marshalErr := json.Marshal(encryptSensitiveCredentials(row.doc))
 		if marshalErr != nil {
 			return marshalErr
@@ -147,8 +167,10 @@ func (db *DB) ReserveAntigravityQuotaSource(ctx context.Context, accountID int64
 		if row.generation != expectedGen {
 			return false, fmt.Errorf("antigravity quota reservation rejected: generation fence account=%d expected=%d current=%d", accountID, expectedGen, row.generation)
 		}
-		if expectedScope != "" && row.familyID != "" && row.familyID != expectedScope {
-			return false, fmt.Errorf("antigravity quota reservation rejected: identity scope fence account=%d expected=%s current=%s", accountID, expectedScope, row.familyID)
+		// scope fence 严格化：期望身份非空时 durable 身份必须完全相等，空身份（family
+		// 列未回填）同样拒绝——不得把配额观测写进身份不明的账号。
+		if expectedScope != "" && row.familyID != expectedScope {
+			return false, fmt.Errorf("antigravity quota reservation rejected: identity scope fence account=%d expected=%s current=%q", accountID, expectedScope, row.familyID)
 		}
 		meta := antigravitySourceMetadataForWrite(row.doc, source)
 		next, _ := int64FromJSONValue(meta[antigravitySourceMetaCurrentAttemptSeq])
@@ -189,7 +211,7 @@ func (db *DB) CommitAntigravityQuotaSource(ctx context.Context, accountID int64,
 		if row.generation != expectedGen {
 			return false, nil
 		}
-		if expectedScope != "" && row.familyID != "" && row.familyID != expectedScope {
+		if expectedScope != "" && row.familyID != expectedScope {
 			return false, nil
 		}
 		if epoch != antigravityQuotaEpochFromDocument(row.doc) {
@@ -202,11 +224,9 @@ func (db *DB) CommitAntigravityQuotaSource(ctx context.Context, accountID int64,
 		successAt := time.Now().UTC().Format(time.RFC3339)
 		facts := antigravityQuotaFactsForWrite(row.doc)
 		antigravityMergeQuotaFacts(facts, incoming, source, mySeq, successAt)
-		encoded, marshalErr := json.Marshal(facts)
-		if marshalErr != nil {
-			return false, marshalErr
-		}
-		row.doc[antigravityQuotaCredentialKey] = string(encoded)
+		// 这里只维护内存工作形态（map）；落库前的统一规范化会把 facts 序列化回 JSON 字符串，
+		// 因此提交路径不再各自 marshal。
+		row.doc[antigravityQuotaCredentialKey] = facts
 		applied = true
 		return true, nil
 	})
@@ -219,7 +239,9 @@ func (db *DB) CommitAntigravityQuotaSource(ctx context.Context, accountID int64,
 // ClearAntigravityQuotaSourcesCAS 清除该账号全部配额 source 事实与定时器，并在
 // **同一短事务内**递增 `antigravity_quota_epoch`（Spec §4.1 失效纪元、验收 #36）。
 // 凭据、models 等目录分区与 credential generation 均保持不变，因此清除后仍在途的
-// 观测（无论其 mySeq 多大）提交时都会因 epoch 不匹配被拒。
+// 观测（无论其 mySeq 多大）提交时都会因 epoch 不匹配被拒。facts 的解析同时兼容 JSON
+// 字符串与 JSON 对象两种形态：即使数据曾被写成对象（历史脏数据），也必须彻底清空事实并
+// 推进 epoch，绝不允许因类型断言失败而静默残留。
 func (db *DB) ClearAntigravityQuotaSourcesCAS(ctx context.Context, accountID int64) (int64, error) {
 	newEpoch := int64(0)
 	err := db.mutateAntigravityQuotaCredentials(ctx, accountID, func(row *antigravityQuotaRowTx) (bool, error) {
@@ -228,24 +250,20 @@ func (db *DB) ClearAntigravityQuotaSourcesCAS(ctx context.Context, accountID int
 			accountID, antigravityQuotaTimerKindPrefix+"%"); err != nil {
 			return false, err
 		}
-		if raw, ok := row.doc[antigravityQuotaCredentialKey].(string); ok && strings.TrimSpace(raw) != "" {
-			var facts map[string]any
-			if json.Unmarshal([]byte(raw), &facts) == nil {
-				// 只删除配额 source 事实；models / 目录分区由目录流自行维护。
-				delete(facts, antigravityQuotaKeyQuotaGroups)
-				delete(facts, antigravityQuotaKeySourceMetadata)
-				delete(facts, antigravityQuotaKeyAICredits)
-				if antigravityQuotaFactsHasContent(facts) {
-					encoded, marshalErr := json.Marshal(facts)
-					if marshalErr != nil {
-						return false, marshalErr
-					}
-					row.doc[antigravityQuotaCredentialKey] = string(encoded)
-				} else {
-					row.doc[antigravityQuotaCredentialKey] = ""
-				}
+		if facts, ok := antigravityQuotaFactsFromDocument(row.doc); ok {
+			// 只删除配额 source 事实；models / 目录分区由目录流自行维护。
+			delete(facts, antigravityQuotaKeyQuotaGroups)
+			delete(facts, antigravityQuotaKeySourceMetadata)
+			delete(facts, antigravityQuotaKeyAICredits)
+			if antigravityQuotaFactsHasContent(facts) {
+				// 仍承载其他内容：以 map 活引用保留，序列化回 JSON 字符串由落库前的
+				// 规范化统一负责。
+				row.doc[antigravityQuotaCredentialKey] = facts
+			} else {
+				row.doc[antigravityQuotaCredentialKey] = ""
 			}
 		}
+		// 非字符串且非对象的非法形态（理论上不存在）由落库前的规范化按清空写法兜底。
 		newEpoch = antigravityQuotaEpochFromDocument(row.doc) + 1
 		row.doc[antigravityQuotaEpochCredentialKey] = newEpoch
 		return true, nil
@@ -324,34 +342,23 @@ func (db *DB) HandleAntigravityRTConflict(ctx context.Context, accountID int64, 
 		return 0, fmt.Errorf("decode pre-rotation credentials: %w", err)
 	}
 	// reload 持久化行：不复用本方内存态。
-	var raw any
-	var durableGen int64
-	var familyColumn string
-	var status string
-	err := db.conn.QueryRowContext(ctx,
-		`SELECT credentials, credential_generation, COALESCE(credential_family_id,''), status FROM accounts WHERE id=$1`,
-		accountID).Scan(&raw, &durableGen, &familyColumn, &status)
-	if errors.Is(err, sql.ErrNoRows) {
-		log.Printf("antigravity rt-conflict audit: account=%d outcome=isolate_identity reason=account_missing rotated_refresh_token_not_persisted=true", accountID)
-		return RTConflictIsolateIdentity, nil
-	}
+	state, err := db.reloadAntigravityRTDurableState(ctx, accountID)
 	if err != nil {
 		return 0, err
 	}
-	durable := decodeCredentials(raw)
-	durableFamily := strings.TrimSpace(familyColumn)
-	if durableFamily == "" {
-		durableFamily = strings.TrimSpace(credentialStringFromMap(durable, "credential_family_id"))
+	if state == nil {
+		log.Printf("antigravity rt-conflict audit: account=%d outcome=isolate_identity reason=account_missing rotated_refresh_token_not_persisted=true", accountID)
+		return RTConflictIsolateIdentity, nil
 	}
-	if reason := antigravityIdentityBreakReason(pre, durable, durableFamily, status); reason != "" {
-		return db.isolateAntigravityIdentity(ctx, accountID, durableGen, reason)
+	if reason := antigravityIdentityBreakReason(pre, state.credentials, state.familyID, state.status); reason != "" {
+		return db.isolateAntigravityIdentity(ctx, accountID, state.generation, reason)
 	}
 	// 分支 (a)：durable winner 已完成同身份换票 → 信任 winner，绝不回写。
-	if strings.TrimSpace(credentialStringFromMap(durable, "access_token")) != strings.TrimSpace(credentialStringFromMap(pre, "access_token")) {
+	if strings.TrimSpace(credentialStringFromMap(state.credentials, "access_token")) != strings.TrimSpace(credentialStringFromMap(pre, "access_token")) {
 		return RTConflictTrustWinner, nil
 	}
 	// 分支 (b) 的前提：expected generation 未变（本方仍是唯一持有已被消费 RT 的一方）。
-	if expectedGen > 0 && durableGen != expectedGen {
+	if expectedGen > 0 && state.generation != expectedGen {
 		return RTConflictTrustWinner, nil
 	}
 	credentialUpdates := antigravityCredentialOnlyUpdates(rotated)
@@ -359,15 +366,64 @@ func (db *DB) HandleAntigravityRTConflict(ctx context.Context, accountID int64, 
 		// 本次没有可落库的凭据字段，等价于无可写事实：信任 durable 状态。
 		return RTConflictTrustWinner, nil
 	}
-	_, applied, replayErr := db.UpdateAccountCredentialsCAS(ctx, accountID, durableGen, credentialUpdates)
+	// 仅供包内测试注入的竞态模拟钩子（生产恒为 nil）：在重放窗口内模拟同身份 winner
+	// 抢先写入，用于确定性地验证失败复验的归类。
+	if antigravityRTReplayRaceHook != nil {
+		antigravityRTReplayRaceHook(accountID)
+	}
+	_, applied, replayErr := db.UpdateAccountCredentialsCAS(ctx, accountID, state.generation, credentialUpdates)
 	if replayErr == nil && applied {
 		return RTConflictReplayCredentialOnly, nil
+	}
+	// 重放失败先复验 durable 状态：generation 被推进或 access_token 已变，都说明同一
+	// 身份上已有 winner 抢先写入（本方只是输掉了这次 CAS），属于分支 (a) 的语义，
+	// 必须信任 winner，绝不可误报身份谱系断裂并落隔离标记。
+	if recheck, recheckErr := db.reloadAntigravityRTDurableState(ctx, accountID); recheckErr != nil {
+		return 0, recheckErr
+	} else if recheck != nil {
+		generationAdvanced := recheck.generation != state.generation
+		tokenChanged := strings.TrimSpace(credentialStringFromMap(recheck.credentials, "access_token")) !=
+			strings.TrimSpace(credentialStringFromMap(pre, "access_token"))
+		if generationAdvanced || tokenChanged {
+			return RTConflictTrustWinner, nil
+		}
 	}
 	reason := "credential-only replay rejected by generation fence"
 	if replayErr != nil {
 		reason = "credential-only replay failed: " + replayErr.Error()
 	}
-	return db.isolateAntigravityIdentity(ctx, accountID, durableGen, reason)
+	return db.isolateAntigravityIdentity(ctx, accountID, state.generation, reason)
+}
+
+// antigravityRTDurableState 是 RT 冲突处理 reload 到的持久化状态。
+type antigravityRTDurableState struct {
+	credentials map[string]any
+	generation  int64
+	familyID    string
+	status      string
+}
+
+// reloadAntigravityRTDurableState 读取账号的持久化凭据行；账号不存在时返回 (nil, nil)。
+func (db *DB) reloadAntigravityRTDurableState(ctx context.Context, accountID int64) (*antigravityRTDurableState, error) {
+	var raw any
+	var generation int64
+	var familyColumn string
+	var status string
+	err := db.conn.QueryRowContext(ctx,
+		`SELECT credentials, credential_generation, COALESCE(credential_family_id,''), status FROM accounts WHERE id=$1`,
+		accountID).Scan(&raw, &generation, &familyColumn, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	doc := decodeCredentials(raw)
+	family := strings.TrimSpace(familyColumn)
+	if family == "" {
+		family = strings.TrimSpace(credentialStringFromMap(doc, "credential_family_id"))
+	}
+	return &antigravityRTDurableState{credentials: doc, generation: generation, familyID: family, status: status}, nil
 }
 
 // antigravityIdentityBreakReason 返回身份谱系断裂的原因；可验证连续时返回空串。
@@ -401,6 +457,11 @@ func (db *DB) isolateAntigravityIdentity(ctx context.Context, accountID, durable
 		antigravityQuotaPermanentRefreshErrorKey: message,
 	})
 	log.Printf("antigravity rt-conflict audit: account=%d outcome=isolate_identity reason=%q rotated_refresh_token_not_persisted=true marker_applied=%v", accountID, reason, applied)
+	// 与日志并行落一条可查询的账号事件，供后台审计与告警消费；写审计失败只降低
+	// 可观测性，不改变分流结论（隔离结论已由上面的标记写入给出）。
+	if auditErr := db.InsertAccountEvent(ctx, accountID, antigravityRTConflictAuditEventType, antigravityRTConflictAuditSource); auditErr != nil {
+		log.Printf("antigravity rt-conflict audit event failed: account=%d type=%s err=%v", accountID, antigravityRTConflictAuditEventType, auditErr)
+	}
 	if err != nil {
 		return RTConflictIsolateIdentity, err
 	}
@@ -449,22 +510,79 @@ func antigravityQuotaFactsHasContent(facts map[string]any) bool {
 	return false
 }
 
-// antigravityQuotaFactsForWrite 返回 credentials 文档内的配额事实对象，缺失时按 V2
-// 契约创建骨架。返回的 map 是文档内的活引用，调用方就地修改即可。
-func antigravityQuotaFactsForWrite(doc map[string]any) map[string]any {
+// antigravityQuotaFactsFromDocument 只读解析 credentials 文档内的配额事实，兼容两种形态：
+// JSON 字符串（落库规范形态）与 map（内存工作形态 / 历史脏数据）。第二个返回值为 false
+// 表示文档内没有可解析的对象事实；本函数不改写文档。
+func antigravityQuotaFactsFromDocument(doc map[string]any) (map[string]any, bool) {
+	if doc == nil {
+		return nil, false
+	}
 	switch typed := doc[antigravityQuotaCredentialKey].(type) {
 	case map[string]any:
-		if typed != nil {
-			return typed
+		if typed == nil {
+			return nil, false
 		}
+		return typed, true
 	case string:
-		if trimmed := strings.TrimSpace(typed); trimmed != "" {
-			var facts map[string]any
-			if json.Unmarshal([]byte(trimmed), &facts) == nil && facts != nil {
-				doc[antigravityQuotaCredentialKey] = facts
-				return facts
-			}
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return nil, false
 		}
+		var facts map[string]any
+		if err := json.Unmarshal([]byte(trimmed), &facts); err != nil || facts == nil {
+			return nil, false
+		}
+		return facts, true
+	}
+	return nil, false
+}
+
+// normalizeAntigravityQuotaCredentialForWrite 是 credentials 落库前的形态栅栏：
+// `antigravity_quota` 持久化后**恒为 JSON 字符串**（全仓库读取端一律经
+// `AccountRow.GetCredential` 取文本，它对非字符串返回 ""，会让内存硬门禁 fail-open）。
+// mutator 就地合并时把它保留成 map 只是内存工作形态，这里统一序列化回字符串；既非字符串
+// 也非对象的非法形态按既有清空写法（空串）兜底，绝不让读取端拿到非字符串。
+func normalizeAntigravityQuotaCredentialForWrite(doc map[string]any) error {
+	if doc == nil {
+		return nil
+	}
+	value, present := doc[antigravityQuotaCredentialKey]
+	if !present {
+		return nil
+	}
+	switch typed := value.(type) {
+	case string:
+		return nil
+	case map[string]any:
+		if typed == nil {
+			doc[antigravityQuotaCredentialKey] = ""
+			return nil
+		}
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return fmt.Errorf("encode antigravity quota facts as JSON string: %w", err)
+		}
+		doc[antigravityQuotaCredentialKey] = string(encoded)
+		return nil
+	default:
+		doc[antigravityQuotaCredentialKey] = ""
+		return nil
+	}
+}
+
+// antigravityQuotaFactsForWrite 返回 credentials 文档内的配额事实对象，缺失时按 V2
+// 契约创建骨架。返回的 map 是文档内的活引用（内存工作形态），调用方就地修改即可，
+// 落库前的规范化负责把它序列化回 JSON 字符串。
+func antigravityQuotaFactsForWrite(doc map[string]any) map[string]any {
+	if facts, ok := antigravityQuotaFactsFromDocument(doc); ok {
+		if _, isMap := doc[antigravityQuotaCredentialKey].(map[string]any); !isMap {
+			// 文档内还是字符串形态：换成解析后的活引用 map，调用方就地修改才会生效。
+			doc[antigravityQuotaCredentialKey] = facts
+		}
+		return facts
+	}
+	if doc == nil {
+		return map[string]any{antigravityQuotaKeySchemaVersion: 2}
 	}
 	facts := map[string]any{antigravityQuotaKeySchemaVersion: 2}
 	doc[antigravityQuotaCredentialKey] = facts
@@ -474,19 +592,8 @@ func antigravityQuotaFactsForWrite(doc map[string]any) map[string]any {
 // antigravitySourceMetadataEntryForRead 只读地定位 credentials 文档内本 source 的元数据，
 // 不创建任何对象（用于提交栅栏判定，拒绝路径不得改写文档）。
 func antigravitySourceMetadataEntryForRead(doc map[string]any, source string) map[string]any {
-	var facts map[string]any
-	switch typed := doc[antigravityQuotaCredentialKey].(type) {
-	case map[string]any:
-		facts = typed
-	case string:
-		if trimmed := strings.TrimSpace(typed); trimmed != "" {
-			var parsed map[string]any
-			if json.Unmarshal([]byte(trimmed), &parsed) == nil {
-				facts = parsed
-			}
-		}
-	}
-	if facts == nil {
+	facts, ok := antigravityQuotaFactsFromDocument(doc)
+	if !ok {
 		return map[string]any{}
 	}
 	metadata, _ := facts[antigravityQuotaKeySourceMetadata].(map[string]any)
