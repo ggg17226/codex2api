@@ -166,6 +166,74 @@ func (a *Account) applyAntigravityQuotaSchedulingLocked(raw string) {
 	a.antigravityQuotaValid = true
 }
 
+// antigravityQuotaGateFacts 报告快照是否仍携带硬门禁与软权重可求值的配额事实。clear
+// 操作只删除 quota_groups/source_metadata/ai_credits 而保留 models 目录分区（Spec §8.2），
+// 因此「空事实」按门禁相关分区判定，与 database 侧的清除语义保持一致。
+func antigravityQuotaGateFacts(snapshot AntigravityQuotaSnapshot) bool {
+	return len(snapshot.Groups) > 0 || snapshot.AICredits != nil || snapshot.Forbidden
+}
+
+// antigravityQuotaAppliedSeq 返回快照里各来源最大的 applied_seq，即内存当前序列。
+func antigravityQuotaAppliedSeq(snapshot AntigravityQuotaSnapshot) int64 {
+	var seq int64
+	for _, meta := range snapshot.SourceMetadata {
+		if meta.AppliedSeq > seq {
+			seq = meta.AppliedSeq
+		}
+	}
+	return seq
+}
+
+func cloneAntigravityModelMaxOutput(values map[string]int) map[string]int {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make(map[string]int, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+// mergeAntigravityQuotaProjectionLocked 把 outbox 行携带的 antigravity_quota(V2 快照)
+// 与 antigravity_quota_epoch 按 Spec §4.3 的原位单调规则合并进已有内存对象。src 是
+// 刚从数据库行装载的临时投影（其排序键已由 applyAntigravityQuotaSchedulingLocked 求值）。
+// 调用方持有 a.mu；Account 指针、在途并发计数与会话绑定一律不动。
+//
+//   - 代际变化：行就是新代际的事实，无条件采用并重新绑定纪元基线；
+//   - src 纪元更新：**序号空间重新初始化**，空事实（clear 动作）同样直接覆盖并清空
+//     门禁派生键——这是远端内存里的 known_zero 能被「删除」单调覆盖的唯一路径，也是
+//     本机曾因纪元落后而丢弃的观测的自愈点（Spec §4.3 自愈义务）；
+//   - src 纪元更旧：迟到的旧纪元，整份丢弃；
+//   - 纪元相同：空事实一律丢弃（删除不得以相同纪元生效）；非空事实要求 applied_seq
+//     不小于内存序列，相等即幂等重放。
+//
+// 纪元递增不等同于代际变化：不清 scope、不动凭据（清 scope 只由 §4.1 ReplaceCAS 触发）。
+func (a *Account) mergeAntigravityQuotaProjectionLocked(src *Account, identityChanged bool) {
+	if a == nil || src == nil {
+		return
+	}
+	if !identityChanged {
+		switch {
+		case src.antigravityQuotaEpoch < a.antigravityQuotaEpoch:
+			return
+		case src.antigravityQuotaEpoch == a.antigravityQuotaEpoch:
+			if !antigravityQuotaGateFacts(src.AntigravityQuota) {
+				return
+			}
+			if antigravityQuotaAppliedSeq(src.AntigravityQuota) < antigravityQuotaAppliedSeq(a.AntigravityQuota) {
+				return
+			}
+		}
+	}
+	a.AntigravityQuota = src.AntigravityQuota
+	a.antigravityQuotaEpoch = src.antigravityQuotaEpoch
+	a.antigravityQuotaValid = src.antigravityQuotaValid
+	a.antigravityQuotaUsedPercent = src.antigravityQuotaUsedPercent
+	a.antigravityQuotaObservedAt = src.antigravityQuotaObservedAt
+	a.antigravityModelMaxOutput = cloneAntigravityModelMaxOutput(src.antigravityModelMaxOutput)
+}
+
 func (a *Account) antigravityUsagePercentForSchedulingLocked(now time.Time) float64 {
 	if !a.antigravityQuotaValid {
 		return 0

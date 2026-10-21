@@ -199,6 +199,10 @@ type Account struct {
 	// AntigravityQuota 是 credentials JSON 中 antigravity_quota 的内存 V2 投影，
 	// 受 a.mu 保护；由账号装载、client.Sync 落库后与 outbox consumer 投影共同更新。
 	AntigravityQuota AntigravityQuotaSnapshot
+	// antigravityQuotaEpoch 是上述内存配额事实所属的失效纪元基线（credentials JSON 的
+	// antigravity_quota_epoch 键）。跨实例投影按它做单调判定：纪元递增即序号空间重新
+	// 初始化，更旧纪元的一切观测一律丢弃（Spec §4.3）。受 a.mu 保护。
+	antigravityQuotaEpoch int64
 	// antigravityPenalty 是 Antigravity 首绑/Fresh 选号避险使用的近期限流惩罚：
 	// 进程内、指数衰减、不落库（见 antigravity_ratelimit.go）。它只影响「下一个
 	// 新会话优先选谁」，不参与冷却判定，也不改变任何既有绑定语义。
@@ -6064,6 +6068,19 @@ func antigravityPersistedHardFence(row *database.AccountRow) (reason string, per
 	return "", false
 }
 
+// antigravityQuotaEpochFromRow 读取 credentials JSON 的 antigravity_quota_epoch 失效
+// 纪元基线，缺失或非法一律 0（Spec §4.1 失效纪元）。
+func antigravityQuotaEpochFromRow(row *database.AccountRow) int64 {
+	if row == nil {
+		return 0
+	}
+	epoch, ok := row.GetCredentialInt64("antigravity_quota_epoch")
+	if !ok || epoch < 0 {
+		return 0
+	}
+	return epoch
+}
+
 // buildAccountFromRow 将数据库账号行转换为运行时账号；凭据缺失或不可用时返回 nil。
 func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRow, modelCooldowns map[int64][]*database.AccountModelCooldownRow) *Account {
 	rt := row.GetCredential("refresh_token")
@@ -6250,6 +6267,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	if isAntigravityAccount {
 		account.applyAntigravityQuotaSchedulingLocked(row.GetCredential("antigravity_quota"))
+		account.antigravityQuotaEpoch = antigravityQuotaEpochFromRow(row)
 		if reason, permanentRefresh := antigravityPersistedHardFence(row); reason != "" {
 			account.AntigravityHardBlocked = true
 			account.AntigravityHardBlockReason = reason
@@ -12609,6 +12627,7 @@ func (s *Store) publishAntigravityRuntimeRow(acc *Account, row *database.Account
 	acc.AntigravityHardBlocked = hardReason != ""
 	acc.AntigravityHardBlockReason = hardReason
 	acc.applyAntigravityQuotaSchedulingLocked(row.GetCredential("antigravity_quota"))
+	acc.antigravityQuotaEpoch = antigravityQuotaEpochFromRow(row)
 	if permanentRefresh {
 		acc.PermanentRefreshFailures = permanentRefreshFailureTerminalLimit
 	} else if hardReason == "" {
