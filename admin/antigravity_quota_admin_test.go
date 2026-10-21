@@ -8,11 +8,13 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
@@ -251,5 +253,115 @@ func TestAdmin_AntigravityStateExposesQuotaGateV2Metadata(t *testing.T) {
 	}
 	if cleared.Quota != nil && len(cleared.Quota.Groups) != 0 {
 		t.Fatalf("quota groups after clear = %+v, want emptied", cleared.Quota.Groups)
+	}
+}
+
+// TestAdmin_AntigravityManualSyncRoutesThroughStoreCoordinator 锁定 P1 修复契约：
+// auth.Store 必须实现 SyncAntigravityAccountForAdmin 使接口探测成功，手动同步真正
+// 交由 Store 协调器执行（flight 单飞 + family lease），而不是探测失败后静默回退到
+// 直连 client.Sync 空转。store 挂载但不带 database：Store 入口必须返回
+// database-backed 错误且不发生直连网络路径。
+func TestAdmin_AntigravityManualSyncRoutesThroughStoreCoordinator(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	accountID, err := db.InsertAccountWithCredentials(ctx, "ag-wired", map[string]interface{}{
+		"upstream_type":        "antigravity",
+		"access_token":         "at-old",
+		"refresh_token":        "rt-old",
+		"credential_family_id": "fam-wired",
+	}, "")
+	if err != nil {
+		t.Fatalf("insert antigravity account failed: %v", err)
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	t.Cleanup(store.Stop)
+	if _, ok := antigravityStoreCoordinator(store); !ok {
+		t.Fatal("auth.Store must satisfy antigravityStoreSyncCoordinator; interface probe failed")
+	}
+
+	handler := &Handler{db: db, store: store}
+	item := handler.refreshAntigravityAccount(ctx, accountID)
+	if item.OK {
+		t.Fatal("manual sync through store must fail when the store has no database")
+	}
+	if !strings.Contains(item.Error, "database-backed store") {
+		t.Fatalf("error = %q, want Store coordinator path error; fell back to direct client.Sync?", item.Error)
+	}
+}
+
+// TestAdmin_AntigravityManualSyncSucceedsThroughStoreCoordinator 端到端验证手动
+// 同步经 Store 统一入口成功：协调器内完成换票与 quota 事实落库，管理端回显并
+// 重载运行时账号。
+func TestAdmin_AntigravityManualSyncSucceedsThroughStoreCoordinator(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var tokenCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/token":
+			atomic.AddInt32(&tokenCalls, 1)
+			fmt.Fprint(w, `{"access_token":"wired-access-new","refresh_token":"wired-refresh-new","expires_in":3600}`)
+		case "/userinfo":
+			fmt.Fprint(w, `{"id":"subject-9","email":"wired@example.com","verified_email":true}`)
+		case "/load":
+			fmt.Fprint(w, `{"cloudaicompanionProject":"project-new","paidTier":{"name":"Pro"}}`)
+		case "/quota":
+			fmt.Fprint(w, `{"models":{"gemini-test":{"quotaInfo":{"remainingFraction":0.8}}}}`)
+		case "/summary":
+			fmt.Fprint(w, `{"groups":[]}`)
+		case "/credits":
+			fmt.Fprint(w, `{"paidTier":{"availableCredits":[]}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	previousEndpoints := auth.DefaultAntigravityEndpoints
+	auth.DefaultAntigravityEndpoints = auth.AntigravityEndpoints{
+		TokenURL: server.URL + "/token", UserInfoURL: server.URL + "/userinfo",
+		LoadProject: []string{server.URL + "/load"}, Quota: []string{server.URL + "/quota"},
+		QuotaSummary: []string{server.URL + "/summary"}, AICredits: []string{server.URL + "/credits"},
+	}
+	defer func() { auth.DefaultAntigravityEndpoints = previousEndpoints }()
+
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	accountID, err := db.InsertAccountWithCredentials(ctx, "ag-manual-sync", map[string]interface{}{
+		"upstream_type":             "antigravity",
+		"access_token":              "at-old",
+		"refresh_token":             "rt-old",
+		"oauth_client_key":          "test",
+		"antigravity_client_id":     "client-id",
+		"antigravity_client_secret": "client-secret",
+		// 过期存量 AT：手动同步通道由 client.Sync 按需换票。
+		"expires_at":           time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
+		"email":                "wired@example.com",
+		"credential_family_id": "fam-manual",
+	}, "")
+	if err != nil {
+		t.Fatalf("insert antigravity account failed: %v", err)
+	}
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2})
+	t.Cleanup(store.Stop)
+	handler := &Handler{db: db, store: store}
+
+	item := handler.refreshAntigravityAccount(ctx, accountID)
+	if !item.OK {
+		t.Fatalf("manual sync through store failed: %+v", item)
+	}
+	if atomic.LoadInt32(&tokenCalls) == 0 {
+		t.Fatal("store coordinator never exchanged the token")
+	}
+	row, err := db.GetAccountByID(ctx, accountID)
+	if err != nil {
+		t.Fatalf("reload account: %v", err)
+	}
+	if got := strings.TrimSpace(row.GetCredential("access_token")); got != "wired-access-new" {
+		t.Fatalf("persisted access_token = %q, want wired-access-new", got)
+	}
+	if store.FindByID(accountID) == nil {
+		t.Fatal("runtime account missing after manual sync reload")
 	}
 }

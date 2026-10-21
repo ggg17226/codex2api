@@ -33,10 +33,6 @@ const (
 	antigravityNoUsableEgressError      = "Antigravity 没有可用代理出口"
 	// antigravityManualRefreshTimeout 是管理端单号同步(换票+项目+权限+配额)的上限。
 	antigravityManualRefreshTimeout = 90 * time.Second
-	// antigravityManualStoreSyncTimeout 是经 Store 统一入口手动同步的外层上限：在途
-	// flight 的有界等待(90s)必须严格小于外层(100s)，否则管理端会在协调器给出"部分
-	// 成功"结论前先行超时（Spec §4.2 手动请求有界等待）。
-	antigravityManualStoreSyncTimeout = 100 * time.Second
 	// antigravityQuotaClearMaxAccounts 是止血清除单次账号上限（Spec §8.2）。
 	antigravityQuotaClearMaxAccounts = 100
 	// antigravityQuotaClearTimeout 覆盖最多 100 个账号的短事务清除 + 运行时重载。
@@ -1975,8 +1971,8 @@ func (h *Handler) syncAntigravityAccountByID(ctx context.Context, id int64) erro
 
 // antigravityStoreSyncCoordinator 是 Store 侧统一管理入口的能力面（Spec §9：
 // `Store.SyncAntigravityAccountForAdmin`）。手动同步经它入单账号 flight 与 family
-// lease，并复用协调器的 90/100s 有界等待；Store 未挂载该入口时（旧装配）管理端平滑
-// 回退到本包既有的控制面直连路径，不得因缺少协调器而不可用。
+// lease，并在传入 ctx 范围内对在途 flight 有界等待；Store 未挂载该入口时（旧装配）
+// 管理端平滑回退到本包既有的控制面直连路径，不得因缺少协调器而不可用。
 type antigravityStoreSyncCoordinator interface {
 	SyncAntigravityAccountForAdmin(ctx context.Context, accountID int64) error
 }
@@ -1991,26 +1987,46 @@ func antigravityStoreCoordinator(store *auth.Store) (antigravityStoreSyncCoordin
 
 // refreshAntigravityAccountViaStore 把手动同步整体交给 Store 协调器：租约、在途去重
 // 与部分成功复用都在协调器内部完成，管理端只负责回显持久化后的事实与运行时重载。
+// ctx 直接继承调用方（单号 90s / 批量按规模 / 状态同步 100s 已在各入口封顶），
+// 不再叠加内层超时；协调器对 flight 的有界等待随外层 ctx 一并生效与取消。
 func (h *Handler) refreshAntigravityAccountViaStore(ctx context.Context, id int64) (antigravityRefreshItem, bool) {
 	coordinator, ok := antigravityStoreCoordinator(h.store)
 	if !ok {
 		return antigravityRefreshItem{}, false
 	}
 	item := antigravityRefreshItem{ID: id}
-	syncCtx, cancel := context.WithTimeout(ctx, antigravityManualStoreSyncTimeout)
-	defer cancel()
-	syncErr := coordinator.SyncAntigravityAccountForAdmin(syncCtx, id)
-	if row, err := h.db.GetAccountByID(syncCtx, id); err == nil && row != nil {
+	syncErr := coordinator.SyncAntigravityAccountForAdmin(ctx, id)
+	// Store 统一入口内整条链路都可能推进 durable 状态（含失败但已落库的换票进展），
+	// 结束后一律失效账号快照缓存，对齐直连路径变更即失效的契约。
+	h.invalidateAccountSnapshotCaches()
+	if row, err := h.db.GetAccountByID(ctx, id); err == nil && row != nil {
 		item.Email = strings.TrimSpace(row.GetCredential("email"))
 		if warning := strings.TrimSpace(row.GetCredential("antigravity_sync_warning")); warning != "" {
 			item.Warning = warning
 		}
 	}
 	if syncErr != nil {
+		switch {
+		case errors.Is(syncErr, auth.ErrAntigravityNoUsableProxy):
+			// 协调器链路的"无可用出口"以哨兵表达，管理端映射为对外统一文案，
+			// 保持手动刷新的 fail-closed 错误契约不随入口切换而变化。
+			syncErr = errors.New(antigravityNoUsableEgressError)
+		case errors.Is(syncErr, auth.ErrAntigravityAccessDenied):
+			// 访问拒绝事实已由 Store 落库并投影为行级硬围栏：与直连路径一致，
+			// 回显为"成功 + 访问拒绝警告"，不作为操作失败。
+			item.Warning = appendAntigravityWarning(item.Warning, syncErr.Error())
+			syncErr = nil
+		case errors.Is(syncErr, auth.ErrAntigravityCredentialGenerationChanged):
+			// 并发推进凭据代际：本次结果已丢弃、运行时已对齐 durable winner，
+			// 沿用直连路径的冲突文案。
+			syncErr = errors.New("账号凭据已被其他操作更新，请重试")
+		}
+	}
+	if syncErr != nil {
 		item.Error = syncErr.Error()
 		return item, true
 	}
-	if err := h.reloadAntigravityRuntimeAccount(syncCtx, id); err != nil {
+	if err := h.reloadAntigravityRuntimeAccount(ctx, id); err != nil {
 		log.Printf("经 Store 协调器刷新 Antigravity 账号 %d 后重载运行时状态失败: %v", id, err)
 		item.Warning = appendAntigravityWarning(item.Warning, "运行时重载失败: "+err.Error())
 	}
