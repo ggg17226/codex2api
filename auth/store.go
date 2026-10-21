@@ -1482,7 +1482,45 @@ func (a *Account) IsAvailable() bool {
 	return a.isAvailableLocked(time.Now())
 }
 
+// antigravityQuotaBlockReasonQuotaExhausted 是配额硬门禁对外暴露的类型化阻断原因
+// （Spec §6.2 #2）。上层（proxy 边缘层）据此把「候选全被门禁阻断」映射为 429 +
+// reason，而不是与容量满、鉴权失败混为一谈的 503。
+const antigravityQuotaBlockReasonQuotaExhausted = "quota_exhausted"
+
+// ErrQuotaExhausted 是「候选账号全因 Antigravity 配额硬门禁被阻断」的哨兵错误：
+// 调用方用 errors.Is 识别后返回 429，而不是排队等待或 503。
+var ErrQuotaExhausted = errors.New("antigravity account quota exhausted")
+
+// antigravityQuotaBlockReasonLocked 返回账号级的类型化阻断原因，未阻断时为空串。
+//
+// Locked 语义：调用方必须已持有 a.mu（读锁或写锁）。谓词本身纯内存只读，不做 I/O、
+// 不起 goroutine（Spec §3.3）。阻断判定与选号决策落在同一次账号临界区内，两者之间
+// 没有可插入其他决策的时间窗（原子线性化）。
+func (a *Account) antigravityQuotaBlockReasonLocked(now time.Time) string {
+	exhausted, _, _ := a.IsAntigravityQuotaExhaustedLocked(now)
+	if exhausted {
+		return antigravityQuotaBlockReasonQuotaExhausted
+	}
+	return ""
+}
+
+// antigravityAccountQuotaBlocked 是自锁封装的阻断查询，供锁外的选号入口复检使用。
+// nil 账号与未命中的账号都返回 false。
+func antigravityAccountQuotaBlocked(acc *Account) bool {
+	if acc == nil {
+		return false
+	}
+	acc.mu.RLock()
+	defer acc.mu.RUnlock()
+	return acc.antigravityQuotaBlockReasonLocked(time.Now()) != ""
+}
+
 func (a *Account) isAvailableLocked(now time.Time) bool {
+	// 配额硬门禁先于 Antigravity 的鉴权豁免分支求值：401 窄恢复（unauthorized
+	// cooldown）只豁免鉴权类围栏，绝不豁免配额事实（Spec §3.3 优先级）。
+	if a.antigravityQuotaBlockReasonLocked(now) != "" {
+		return false
+	}
 	if a.Status == StatusError {
 		return false
 	}
@@ -7293,6 +7331,11 @@ func (s *Store) accountLazySelectable(acc *Account) bool {
 }
 
 func (a *Account) lazySelectableLocked(now time.Time) bool {
+	// 与 isAvailableLocked 同一处硬门禁：lazy 模式是选号入口的另一条腿，漏掉它会让
+	// 被阻断账号在 lazy 部署下照常入选（含 401 窄恢复豁免路径）。
+	if a.antigravityQuotaBlockReasonLocked(now) != "" {
+		return false
+	}
 	if a.Status == StatusError {
 		return false
 	}
@@ -8058,6 +8101,12 @@ func (s *Store) takeByIDModeWithCapacity(id int64, apiKeyID int64, exclude map[i
 	if target == nil {
 		return nil, false
 	}
+	// 配额硬门禁在这里复检（且先于 continuation/spark 豁免）：被阻断是「不可选」，
+	// 不是「并发满」，因此第二个返回值必须保持 false——续链据此保留绑定并返回 nil，
+	// 新请求据此 fallthrough 借用其他账号，两者都不得进入 WaitForDispatchAvailable。
+	if antigravityAccountQuotaBlocked(target) {
+		return nil, false
+	}
 	continuationEligible := continuation && target.UsageLimitContinuationEligible()
 	sparkEligible := policy == DispatchPolicySpark && target.SparkDispatchEligible()
 	if s.GetLazyMode() {
@@ -8736,6 +8785,15 @@ func (s *Store) tryReclaimSessionSlot(acc *Account, sessionKey string, updateSch
 		return false
 	}
 	if accountDispatchBlocked(acc) {
+		if releaseOccupiedAccountSlot(acc) {
+			s.notifySchedulerAccountAvailability(acc, false)
+		}
+		return false
+	}
+	// 成功返回前复检配额硬门禁：预留槽的判定发生在选号入口，门禁可能在此期间被新的
+	// 观测置位。宁可回滚这次回收，也不得把请求交付给已耗尽的账号。唤醒等待者由置位
+	// 门禁的那次投影刷新负责，这里不再全局广播，避免每次回收都触发一轮空转重扫。
+	if antigravityAccountQuotaBlocked(acc) {
 		if releaseOccupiedAccountSlot(acc) {
 			s.notifySchedulerAccountAvailability(acc, false)
 		}
@@ -12671,6 +12729,10 @@ func (s *Store) publishAntigravityRuntimeRow(acc *Account, row *database.Account
 		atomic.StoreInt32(&acc.DispatchPaused, 1)
 	}
 	s.fastSchedulerUpdate(acc)
+	// 配额快照与硬围栏随本行一起刷新：门禁可能刚刚转为阻断或解除阻断（reset 到期、
+	// clear 动作、止血开关翻转），必须唤醒排队中的等待者立即重新求值，否则它们会
+	// 空等到超时（Spec §6.2 #2）。
+	s.notifySchedulerAvailability()
 }
 
 // reloadAntigravityRuntimeOrRemove reconciles a runtime account with the
